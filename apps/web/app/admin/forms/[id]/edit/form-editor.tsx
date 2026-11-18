@@ -62,7 +62,7 @@ import {
   type Tab,
 } from './_components/editor-toolbar';
 import { stepFromGalleryItem, stepListLabel, type GalleryItem } from './_components/question-types';
-import { TEMPLATES } from './_components/templates';
+import { getTemplateConfig } from './_components/templates';
 import { getBuilderMessages, tb, type TemplateId } from './_components/builder-messages';
 import type { EditorMessages } from './_components/messages';
 import './_components/builder.css';
@@ -672,7 +672,7 @@ export function FormEditor({
     }
   }
   function applyTemplate(tid: TemplateId) {
-    const cfg = TEMPLATES[tid];
+    const cfg = getTemplateConfig(tid, locale);
     // Preserve a name the user already typed; only fall back to the template's
     // name when the field is still blank (V4-11 — templates swap config, not name).
     setName((n) => (n.trim() ? n : bm.empty.templates[tid].name));
