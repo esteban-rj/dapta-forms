@@ -55,6 +55,7 @@ import type { Db } from '@quill/db';
 import { HealthController, DocsController } from './controllers';
 import { PublicController } from './public.controller';
 import { AdminCrudController } from './admin-crud.controller';
+import { FormAiController } from './form-ai.controller';
 import { BrandingController } from './branding.controller';
 import { AttributionController } from './attribution.controller';
 import { AttributionService } from './attribution.service';
@@ -96,6 +97,7 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
     DocsController,
     PublicController,
     AdminCrudController,
+    FormAiController,
     ApiKeysController,
     BrandingController,
     AttributionController,
