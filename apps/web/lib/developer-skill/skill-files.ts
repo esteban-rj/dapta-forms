@@ -76,7 +76,7 @@ Authorization: Bearer $DFORMS_API_KEY
 5. **On a 429, wait.** Sleep the number of seconds in the \`Retry-After\` header (also \`retryAfterSec\` in the body), then continue. The limit is 120 requests per minute per key.
 6. **Fix every issue at once.** A 400 lists all problems in \`issues[]\`. Each \`path\` is the field's dot path inside the request body, so it starts with the body's own key: \`config.steps.2.flowGroup\` on \`POST /v1/forms\` and \`PUT /v1/forms/{id}\`, \`destinations.0.settings.timeoutMs\` on \`PUT /v1/forms/{id}/destinations\`. Correct all of them before sending again.
 7. **Respect other people's edits.** A 409 \`STALE\` means someone saved the form since you read it. Take the form from \`current\` in the error body, apply your change again on top of it, and retry with its \`updatedAt\`. Never drop their changes.
-8. **Destinations have their own route.** Webhooks and HubSpot are set with \`PUT /v1/forms/{id}/destinations\`. \`PUT /v1/forms/{id}\` ignores \`destinations\` inside the config: they are not saved, and the live ones stay as they are.
+8. **Destinations have their own route.** Webhooks, HubSpot, Google Sheets, Salesforce and HighLevel are set with \`PUT /v1/forms/{id}/destinations\`. \`PUT /v1/forms/{id}\` ignores \`destinations\` inside the config: they are not saved, and the live ones stay as they are.
 
 ## Step types
 
@@ -104,6 +104,8 @@ Pick the \`type\` that matches what the step asks. \`name\`, \`email\` and \`pho
 - **\`@score\`** is the running score: the points of the steps shown before this one, without counting the step itself. Only \`gt\`, \`lt\`, \`eq\` and \`between\` apply to it. Put a step gated by score after the last scored question, or the questions after it never count toward the gate. See \`recipes/gate-a-step-by-score.md\`.
 - **Placeholders:** \`[step_key]\` inserts an answer into a step's \`question\` and \`helper\`, an outcome's \`label\` and \`message\`, the \`ending\` texts, a reveal step's texts and a \`redirectUrl\` (percent-encoded there). A question can only use answers from steps before it.
   - When the form runs embedded (in an iframe or with \`?embed=1\`), a \`redirectUrl\` never carries answers: every query parameter with a placeholder is dropped and the rest of the URL is kept. Placeholders reach the redirect only on the form's own page.
+  - \`ending.forwardUtm: true\` appends the visitor's \`utm_*\` parameters to every redirect: the \`ending\` one, an outcome's own \`redirectUrl\` and the redirect after a booking. A \`utm_*\` key already written in the URL is kept and never overwritten. The UTMs are forwarded when the form is embedded too, because they are not answers. Absent or \`false\` forwards nothing.
+  - Answers placed in a \`redirectUrl\` (an email, say) end up in the destination site's browser history and server logs. Prefer a non-identifying answer, or none.
   - A \`name\` step stores \`firstname\` and \`lastname\`, never \`name\`. It exposes \`[firstname]\`, \`[lastname]\` and \`[name]\`, the full name. If a step's own \`key\` is \`name\` and it is not a \`name\` step, \`[name]\` is that step's answer.
   - A placeholder with no answer disappears with the comma or space that joined it: \`"Thanks, [name]!"\` reads \`"Thanks!"\`.
   - A checkbox step does not take placeholders in its question.
@@ -235,6 +237,7 @@ Everything here except reading the brand kit, the link pages and the integration
 | GET, PUT | \`/v1/forms/{id}/notifications\`, \`/v1/forms/{id}/notifications/{emailKey}\` | The same, for one form. |
 | GET | \`/v1/integrations\`, \`/v1/integrations/webhooks\` | Which integrations are connected, and every webhook in the workspace. Read only. |
 | GET | \`/v1/integrations/hubspot/properties\`, \`/v1/integrations/calendly/event-types\` | What a destination or a scheduler step can point at. |
+| GET | \`/v1/integrations/gohighlevel/fields\` | The HighLevel contact fields a destination maps to: \`standard\` (target \`{ "kind": "standard", "field": key }\`) and \`custom\` (target \`{ "kind": "custom", "id", "key", "dataType" }\`, copied as listed). The score takes a \`NUMERICAL\` field, the submitted date a \`DATE\` one, a UTM a \`TEXT\` or \`LARGE_TEXT\` one; a fixed value never targets email or phone. \`?refresh=1\` skips the 5-minute copy. \`enabled: false\` with \`reason\` \`not_connected\` or \`rejected\`: HighLevel is connected in the dashboard only (a pasted Private Integration token). |
 
 ## Not available with a key
 
@@ -269,6 +272,7 @@ Every error is JSON with a stable \`error\` code and an English \`message\`:
 |---|---|---|
 | 400 | \`BAD_REQUEST\` | Read \`issues[]\`, fix every entry, send again. |
 | 400 | \`STEPS_REQUIRED\` | A \`PUT /v1/forms/{id}\` config without \`steps\`. Send the full \`steps\` array. |
+| 400 | \`INTEGRATION_NOT_CONNECTED\` | A new or changed Google Sheets, Salesforce or HighLevel destination, switched on, for a provider the workspace has not connected (on \`PUT /v1/forms/{id}/destinations\` or in the config of \`POST /v1/forms\`). An entry sent back exactly as stored is kept. Give the user \`integrationsUrl\`: connecting happens in their browser. Then send the destinations again. With \`unavailable: true\` this dForms deployment cannot connect the provider at all: there is nothing to connect and the same call is refused again, so leave that destination out or switched off and tell the user whoever runs the deployment has to set it up. |
 | 401 | \`INVALID_API_KEY\` | The key is unknown, revoked, or its owner is no longer in the workspace. Ask the user for a new key. |
 | 403 | \`KEY_NOT_ALLOWED\` | This route is dashboard only. Tell the user to do it in dForms. |
 | 403 | \`WORKSPACE_FORBIDDEN\` | You sent a workspace header for another workspace. Drop the header. |

@@ -29,6 +29,7 @@ import { AuthService } from './auth.service';
 import { BrandingController } from './branding.controller';
 import { FormDestinationsController } from './integrations.controller';
 import { LocalAuthProvider, type HostPrincipal, type ReqLike } from './auth.provider';
+import { strictDestinationIssues } from './strict-config';
 
 let db: Db;
 let accountId: string;
@@ -384,6 +385,73 @@ describe('strict rules with an API key', () => {
     const plain = { destinations: [{ type: 'webhook', enabled: true, settings: { url: 'https://example.com/hook' } }] };
     await expect(key.destinations.putDestinations(req(), formId, plain)).resolves.toBeTruthy();
   });
+
+  it('takes events on a HubSpot or Salesforce destination: their cards show the partials switch', async () => {
+    const body = {
+      destinations: [
+        { type: 'webhook', enabled: true, events: ['complete'], settings: { url: 'https://example.com/hook' } },
+        { type: 'hubspot', enabled: true, events: ['complete'], fieldMappings: { email: 'email' } },
+        { type: 'salesforce', enabled: false, events: ['partial', 'complete'], fieldMappings: { email: 'Email' } },
+      ],
+    };
+    await key.destinations.putDestinations(req(), formId, body);
+    const stored = cfg((await getFormById(db, accountId, formId))!.config).destinations as { type: string; events?: string[] }[];
+    expect(stored.map((d) => [d.type, d.events])).toEqual([
+      ['webhook', ['complete']],
+      ['hubspot', ['complete']],
+      ['salesforce', ['partial', 'complete']],
+    ]);
+  });
+
+  it('refuses partials only on HubSpot, Salesforce or HighLevel: their switch always sends the complete response', async () => {
+    const body = {
+      destinations: [
+        { type: 'hubspot', enabled: true, events: ['partial'], fieldMappings: { email: 'email' } },
+        { type: 'salesforce', enabled: false, events: ['partial'], fieldMappings: { email: 'Email' } },
+        { type: 'gohighlevel', enabled: false, events: ['partial'], fieldMappings: {} },
+        // Empty is the kind's default, and the webhook keeps its own triggers.
+        { type: 'webhook', enabled: true, events: ['partial'], settings: { url: 'https://example.com/hook' } },
+      ],
+    };
+    const r = await refusal(key.destinations.putDestinations(req(), formId, body));
+    expect(r.issues).toEqual([
+      { path: 'destinations.0.events', code: 'UNSUPPORTED_FIELD', message: expect.stringMatching(/always receives complete/) },
+      { path: 'destinations.1.events', code: 'UNSUPPORTED_FIELD', message: expect.stringMatching(/always receives complete/) },
+      { path: 'destinations.2.events', code: 'UNSUPPORTED_FIELD', message: expect.stringMatching(/always receives complete/) },
+    ]);
+    const empty = {
+      destinations: [{ type: 'salesforce', enabled: false, events: [], fieldMappings: { email: 'Email' } }],
+    };
+    await expect(key.destinations.putDestinations(req(), formId, empty)).resolves.toBeTruthy();
+  });
+
+  it('takes the partials switch on a HighLevel destination from a key, as its card writes it', async () => {
+    const body = {
+      destinations: [
+        { type: 'hubspot', enabled: true, events: ['partial', 'complete'], fieldMappings: { email: 'email' } },
+        { type: 'gohighlevel', enabled: false, events: ['partial', 'complete'], fieldMappings: {} },
+      ],
+    };
+    await expect(key.destinations.putDestinations(req(), formId, body)).resolves.toBeTruthy();
+    const stored = (await getFormById(db, accountId, formId))!.config as { destinations?: unknown[] };
+    expect(stored.destinations).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'gohighlevel', events: ['partial', 'complete'] })]),
+    );
+  });
+
+  it('takes events on a HighLevel destination from a key: its card has the partials switch', () => {
+    const entry = (events: unknown) => ({ type: 'gohighlevel', enabled: true, events, fieldMappings: {} });
+    for (const events of [['complete'], ['partial', 'complete']]) {
+      expect(strictDestinationIssues([entry(events)], ['destinations'])).toEqual([]);
+    }
+    // The dashboard-only webhook fields stay refused next to it.
+    expect(
+      strictDestinationIssues(
+        [entry(['partial', 'complete']), { type: 'webhook', settings: { url: 'https://example.com/hook', timeoutMs: 5000 } }],
+        ['destinations'],
+      ).map((i) => i.path),
+    ).toEqual(['destinations.1.settings.timeoutMs']);
+  });
 });
 
 describe('a session keeps saving legacy forms exactly as before', () => {
@@ -469,6 +537,46 @@ describe('POST /v1/forms drops the HubSpot mirror state', () => {
       expect((stored.destinations![0] as { settings: Record<string, unknown> }).settings).not.toHaveProperty(
         'formGuid',
       );
+    });
+  }
+});
+
+describe('POST /v1/forms drops the Google Sheets header bookkeeping', () => {
+  // A forged `headerSnapshot` would let the first heading change overwrite
+  // somebody's row 1; a forged `headerForeign` or `headerBroken` would stop
+  // the header row from ever syncing. Only the API writes these.
+  const state = { spreadsheetId: 'sheet-1', sheetTitle: '', headers: ['Name', 'Phone'] };
+  const withSheet = config([step()], {
+    destinations: [
+      {
+        type: 'google-sheets',
+        // Switched off: this account has no Google connection, and an agent's
+        // enabled Sheets entry would be refused before anything is stored
+        // (INTEGRATION_NOT_CONNECTED). The bookkeeping is dropped either way.
+        enabled: false,
+        settings: {
+          spreadsheetId: 'sheet-1',
+          headerSnapshot: state,
+          headerForeign: state,
+          headerBroken: { ...state, reason: 'forbidden', at: Date.now() },
+        },
+        columns: [{ header: 'Name', source: 'answer', key: 'name' }],
+      },
+    ],
+  });
+
+  for (const [who, get] of [
+    ['a session', () => session],
+    ['an API key', () => key],
+  ] as const) {
+    it(`for ${who}`, async () => {
+      const created = await get().forms.createForm(req(), { name: 'Forged', config: withSheet });
+      const stored = cfg((await getFormById(db, accountId, created.id))!.config);
+      const settings = (stored.destinations![0] as { settings: Record<string, unknown> }).settings;
+      expect(settings).not.toHaveProperty('headerSnapshot');
+      expect(settings).not.toHaveProperty('headerForeign');
+      expect(settings).not.toHaveProperty('headerBroken');
+      expect(settings.spreadsheetId).toBe('sheet-1');
     });
   }
 });

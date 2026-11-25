@@ -25,7 +25,8 @@
     "changeset": "changeset",
     "publish-gate": "bash scripts/publish-gate.sh",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
-    "qa": "playwright test -c qa/playwright.config.ts"
+    "qa": "playwright test -c qa/playwright.config.ts",
+    "qa:component": "pnpm run build:packages && playwright test -c qa/playwright.component.config.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^2.27.10",
@@ -33,11 +34,18 @@
     "@commitlint/config-conventional": "^19.8.1",
     "@playwright/test": "^1.61.1",
     "cross-env": "^7.0.3",
+    "esbuild": "^0.28.1",
     "prettier": "^3.4.2",
     "turbo": "^2.3.3",
     "typescript": "^5.7.2"
   },
   "pnpm": {
+    "overrides": {
+      "@nestjs/common>file-type": "^21.3.4",
+      "body-parser@1": "1.20.9",
+      "multer": "2.5.0",
+      "qs@6": "^6.17.1"
+    },
     "onlyBuiltDependencies": [
       "better-sqlite3",
       "esbuild",

@@ -34,6 +34,41 @@ export {
   toHubSpotDateMs,
   HUBSPOT_API_BASE,
 } from './adapters/hubspot';
+export {
+  GoogleSheetsDestination,
+  GoogleSheetsHttpError,
+  type GoogleSheetsDestinationOptions,
+  appendRange,
+  buildRow,
+  cellText,
+  SHEETS_API_BASE,
+  DEFAULT_SHEETS_TIMEOUT_MS,
+} from './adapters/google-sheets';
+export {
+  SalesforceDestination,
+  SalesforceHttpError,
+  SALESFORCE_API_VERSION,
+  SALESFORCE_NOT_PROVIDED,
+  companyFromEmail,
+  fieldValue as salesforceFieldValue,
+  soqlString,
+  type SalesforceDestinationOptions,
+} from './adapters/salesforce';
+export {
+  GoHighLevelDestination,
+  GoHighLevelHttpError,
+  GOHIGHLEVEL_API_BASE,
+  GOHIGHLEVEL_API_VERSION,
+  GOHIGHLEVEL_USER_AGENT,
+  DEFAULT_GOHIGHLEVEL_TIMEOUT_MS,
+  goHighLevelHeaders,
+  goHighLevelResult,
+  goHighLevelCustomValue,
+  toGoHighLevelDay,
+  toGoHighLevelNumber,
+  toGoHighLevelPhone,
+  type GoHighLevelUpsertBody,
+} from './adapters/gohighlevel';
 // The mirror form: what turns a submission into a "Form submission" activity on
 // the contact rather than a Note. The API creates the form (it owns the database
 // the guid is recorded in); the adapter only posts to it.

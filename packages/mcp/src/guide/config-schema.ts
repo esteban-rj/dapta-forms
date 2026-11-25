@@ -33,6 +33,22 @@ export const UNSUPPORTED_CONFIG_FIELDS = [
 type JsonSchema = Record<string, unknown>;
 
 /**
+ * Destination kinds the editor has no card for yet. Their variant is left out
+ * of `destinations[]`, so an agent that validates against the schema never
+ * builds one. Empty: every destination kind has its card (HighLevel's came
+ * with its Connections card and its form card).
+ */
+export const HIDDEN_DESTINATION_TYPES: readonly string[] = [];
+
+/**
+ * Destination kinds whose `events` has no control in the editor yet. Left out
+ * of those variants; the API refuses it from an agent (`strict-config.ts`).
+ * None today: the webhook has its trigger, and HubSpot and Salesforce their
+ * "send partial responses too" switch. HighLevel's variant is hidden whole.
+ */
+export const EVENTS_WITHOUT_CONTROL: readonly string[] = [];
+
+/**
  * Of those fields, the ones the editor writes itself, with the only value the
  * API accepts for each. Every step the builder makes carries them and so does
  * every config the API answers with, so a config read and sent straight back
@@ -96,6 +112,8 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = {
     'name steps on the one page layout only: a visible label above each input, keyed by the sub-field key (firstname, lastname unless fields says otherwise), for example {"firstname": "Nombre", "lastname": "Apellido"}. With any label set, the question text is kept for screen readers and the response column but not shown. Ignored on slides.',
   'branding.density':
     'One page layout only. "compact" removes the lines between questions and spaces fields 16 px apart, like a regular web form; "comfortable" (the default when absent) is the original spacing. Ignored on slides.',
+  'steps.[].scheduler.provider':
+    'calendly, hubspot_meetings or dcal (Dapta\'s own scheduler). A scheduler step the dForms editor adds is born with dcal; absent means calendly, so a step stored before dCal existed still reads as Calendly. Calendly event types come from list_event_types with provider calendly (provider is required). dCal event types cannot be listed over MCP: the event is picked in the form editor, and a step left without a url asks for it there.',
   'branding.buttonTextColor':
     'Text color of the solid button (buttonStyle "solid"). Leave it out for the automatic color that contrasts with primaryColor. Ignored when buttonStyle is "outline" or "soft".',
 };
@@ -161,6 +179,48 @@ function removeField(
   return removed;
 }
 
+/** The `type` constant of one `destinations[]` variant, or undefined. */
+function destinationTypeOf(variant: unknown): string | undefined {
+  const props = (variant as JsonSchema | null)?.properties as Record<string, { const?: unknown }> | undefined;
+  return typeof props?.type?.const === 'string' ? props.type.const : undefined;
+}
+
+/**
+ * Drop the variants of {@link HIDDEN_DESTINATION_TYPES} from `destinations[]`
+ * and `events` from the variants of {@link EVENTS_WITHOUT_CONTROL}. Throws when
+ * either finds nothing, so a renamed type cannot quietly publish them again.
+ */
+function hideDestinationParts(root: JsonSchema): void {
+  const hidden = new Set<string>();
+  const stripped = new Set<string>();
+  for (const node of step(step([root], 'destinations'), '[]')) {
+    for (const key of ['anyOf', 'oneOf'] as const) {
+      const list = node[key];
+      if (!Array.isArray(list)) continue;
+      node[key] = list.filter((member) => {
+        const type = destinationTypeOf(member);
+        if (type === undefined) return true;
+        if (HIDDEN_DESTINATION_TYPES.includes(type)) {
+          hidden.add(type);
+          return false;
+        }
+        const props = (member as JsonSchema).properties as Record<string, unknown> | undefined;
+        if (EVENTS_WITHOUT_CONTROL.includes(type) && props && 'events' in props) {
+          delete props.events;
+          stripped.add(type);
+        }
+        return true;
+      });
+    }
+  }
+  for (const type of HIDDEN_DESTINATION_TYPES) {
+    if (!hidden.has(type)) throw new Error(`Hidden destination type ${type} is not in formConfigSchema any more.`);
+  }
+  for (const type of EVENTS_WITHOUT_CONTROL) {
+    if (!stripped.has(type)) throw new Error(`Destination type ${type} has no events in formConfigSchema any more.`);
+  }
+}
+
 /** Set `description` on the field at `path` everywhere it appears; returns how many. */
 function describeField(root: JsonSchema, path: string, description: string): number {
   const segments = path.split('.');
@@ -219,6 +279,7 @@ export function formConfigJsonSchema(audience: ConfigSchemaAudience = 'rest'): J
       throw new Error(`Unsupported config field ${path} is not in formConfigSchema any more.`);
     }
   }
+  hideDestinationParts(schema);
   for (const [path, description] of Object.entries(FIELD_DESCRIPTIONS)) {
     if (describeField(schema, path, description) === 0) {
       throw new Error(`Described config field ${path} is not in formConfigSchema any more.`);

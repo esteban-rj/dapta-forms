@@ -21,6 +21,7 @@ import {
   resolveOutcome,
   resolveEnding,
   redirectUrlFor,
+  forwardedUtm,
   computeScore,
   partialSubmitKey,
   revealAfterKey,
@@ -67,6 +68,8 @@ import {
   useCaptchaGate,
   captchaAborted,
   submitFinal,
+  useCampaignUtm,
+  sameCampaign,
   captureUtm,
   captureDefaults,
   withAnswer,
@@ -207,7 +210,9 @@ export function FormRenderer({
   useCalendlyPreload(calendlyPreloadKeys, sessionId);
   // The page this form is answered on, asked once per submit (inert without
   // `visitCapture`).
-  const resolveVisit = useHostVisit(visitCapture, name);
+  // The visitor's campaign for the booking page: the same set the submission carries.
+  const { utm: campaign, own: ownUtm, record: recordCampaign, learnHost } = useCampaignUtm();
+  const resolveVisit = useHostVisit(visitCapture, name, learnHost);
 
   /**
    * Authorize one upload for a `file` step.
@@ -313,6 +318,9 @@ export function FormRenderer({
   const [booking, setBooking] = useState<{ outcome: FormOutcome; score: number } | null>(null);
 
   const utmRef = useRef<Record<string, string>>({});
+  // The UTMs this run submitted (form's own, else the landing's), kept for the
+  // redirects that fire after `finalize` (deferred, post-booking).
+  const redirectUtm = useRef<Record<string, string>>({});
   const redirected = useRef(false); // a deferred redirect fires exactly once
   const viewTracked = useRef(false);
   const startSent = useRef(false); // one `start` per session, whichever path emits it
@@ -344,6 +352,7 @@ export function FormRenderer({
     const outcome = resolveOutcome(engineConfig, done.score, answers);
     const ending = resolveEnding(engineConfig, outcome, answers, {
       embedded: isEmbeddedRender(),
+      utm: redirectUtm.current,
     });
     if (!ending.redirectUrl || ending.redirectDelayMs <= 0) return;
     if (!isSafeHttpUrl(ending.redirectUrl)) return;
@@ -575,6 +584,7 @@ export function FormRenderer({
   function withData(a: Answers, resolved?: ResolvedVisit): Record<string, unknown> {
     // The landing's campaign stands in only when the form's own URL has none.
     const utm = mergeHostUtm(utmRef.current, resolved?.hostUtm);
+    recordCampaign(utm);
     return Object.keys(utm).length > 0 ? { ...a, utm } : { ...a };
   }
 
@@ -679,6 +689,9 @@ export function FormRenderer({
           }),
         );
       }
+      // The campaign the submit carried, for the redirect below and the ones
+      // that fire later (deferred, post-booking) when the form forwards UTMs.
+      redirectUtm.current = mergeHostUtm(utmRef.current, (await visitReady)?.hostUtm);
       const score = res.score ?? 0;
       const outcome = resolveOutcome(engineConfig, score, finalAnswers);
       // An outcome with a booking config shows the inline scheduling screen
@@ -694,6 +707,7 @@ export function FormRenderer({
       // repeating the URL on every range.
       const ending = resolveEnding(engineConfig, outcome, finalAnswers, {
         embedded: isEmbeddedRender(),
+        utm: redirectUtm.current,
       });
       if (ending.redirectUrl) {
         // Runtime XSS guard: only navigate to http(s). A non-http(s) protocol
@@ -735,12 +749,18 @@ export function FormRenderer({
           provider: details.provider,
           ...(details.eventUri ? { eventUri: details.eventUri } : {}),
           ...(details.inviteeUri ? { inviteeUri: details.inviteeUri } : {}),
+          ...(details.bookingUid ? { bookingUid: details.bookingUid } : {}),
           ...(details.startTime ? { startTime: details.startTime } : {}),
         }),
       );
       if (isTransportError(rec)) console.warn('[forms] post-submit booking record failed');
       const redirectUrl = outcome?.redirectUrl
-        ? redirectUrlFor(outcome.redirectUrl, answers, isEmbeddedRender())
+        ? redirectUrlFor(
+            outcome.redirectUrl,
+            answers,
+            isEmbeddedRender(),
+            forwardedUtm(engineConfig, redirectUtm.current),
+          )
         : null;
       if (redirectUrl && isSafeHttpUrl(redirectUrl)) {
         navigateTop(redirectUrl);
@@ -748,7 +768,7 @@ export function FormRenderer({
       }
       setPhase('done'); // `done` state was set in finalize
     },
-    [accountCode, slug, sessionId, booking, answers],
+    [accountCode, slug, sessionId, booking, answers, engineConfig],
   );
 
   // Completes the current screen and moves on. `members` are the questions
@@ -886,6 +906,7 @@ export function FormRenderer({
           provider: details.provider,
           ...(details.eventUri ? { eventUri: details.eventUri } : {}),
           ...(details.inviteeUri ? { inviteeUri: details.inviteeUri } : {}),
+          ...(details.bookingUid ? { bookingUid: details.bookingUid } : {}),
           ...(details.startTime ? { startTime: details.startTime } : {}),
         }),
       );
@@ -1119,7 +1140,10 @@ export function FormRenderer({
           answers={answersRef.current}
           sessionId={sessionId}
           locale={locale}
-          preloadKey={booking.outcome.booking.url}
+          utm={campaign}
+          // A preloaded widget carries only this page's own UTMs (Calendly's
+          // script forwards them), so it is used only when that IS the campaign.
+          preloadKey={sameCampaign(campaign, ownUtm) ? booking.outcome.booking.url : undefined}
           onBooked={(details) => void handleBooked(details)}
         />
       </PhaseShell>
@@ -1447,6 +1471,10 @@ export function FormRenderer({
       answers,
       step.scheduler?.prefillMap,
       config.steps as FormStep[],
+      // The map's keys are the PROVIDER's field ids, and the two providers name
+      // them differently (dCal by field name, Calendly positionally), so the
+      // resolver cannot tell a custom question from a built-in without this.
+      step.scheduler?.provider ?? 'calendly',
     );
     const booking = step.scheduler
       ? schedulerToBooking(step.scheduler, schedPrefill.customAnswers)
@@ -1482,8 +1510,13 @@ export function FormRenderer({
                     extraCustomAnswers={schedPrefill.customAnswers}
                     sessionId={sessionId}
                     locale={locale}
+                    utm={campaign}
                     hideHeader
-                    preloadKey={step.scheduler ? schedulerToBooking(step.scheduler)?.url : undefined}
+                    preloadKey={
+                      step.scheduler && sameCampaign(campaign, ownUtm)
+                        ? schedulerToBooking(step.scheduler)?.url
+                        : undefined
+                    }
                     onBooked={(details) => void handleSchedulerBooked(step, details)}
                   />
                 ) : (

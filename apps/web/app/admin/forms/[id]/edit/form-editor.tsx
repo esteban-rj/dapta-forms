@@ -26,6 +26,7 @@ import { useAutosave } from '@/lib/use-autosave';
 import { clearDraftBackup, readDraftBackup, writeDraftBackup } from '@/lib/draft-backup';
 import { cn } from '@/lib/cn';
 import type { AttributionStatus } from '@/lib/admin-api';
+import type { ReferralLock } from '@/lib/referral-lock';
 import { anchorRevealsLast } from './_components/logic-util';
 import {
   moveStep,
@@ -65,6 +66,9 @@ import { stepFromGalleryItem, stepListLabel, type GalleryItem } from './_compone
 import { getTemplateConfig } from './_components/templates';
 import { getBuilderMessages, tb, type TemplateId } from './_components/builder-messages';
 import type { EditorMessages } from './_components/messages';
+import { publishFormSave, useCombinedSave } from '@/lib/integrations-save-status';
+import { runDestinationWrite } from '@/lib/integrations-save-queue';
+import { ConnectTabMark } from './_components/connect-tab-mark';
 import './_components/builder.css';
 
 const AUTOSAVE_MS = 900;
@@ -199,7 +203,13 @@ export function FormEditor({
    * same setting as Brand kit). Null when the deployment draws no attribution
    * or the read failed: the panel then offers the size alone.
    */
-  attribution?: { initial: AttributionStatus; canEdit: boolean; daptaAiUrl: string | null } | null;
+  attribution?: {
+    initial: AttributionStatus;
+    canEdit: boolean;
+    daptaAiUrl: string | null;
+    /** The owner's referral progress while the program is on (`referralLockOf`). */
+    referral?: ReferralLock | null;
+  } | null;
 }) {
   const bm = getBuilderMessages(locale);
   // The switch's live state: turning it off from Design updates both previews
@@ -445,7 +455,18 @@ export function FormEditor({
     initiallyDirty: config !== initialConfig,
     debounceMs: AUTOSAVE_MS,
   });
-  const status = autosave.status;
+  // The topbar speaks for BOTH saves: the form's, and the Connect tab's
+  // integrations (a separate autosave). Whichever is worse wins, so it never
+  // says "Saved" while the integrations failed to save.
+  //
+  // Both saves feed ONE store snapshot, which the topbar and the Connect tab's
+  // save pill both render, so in any render they show the same state.
+  useEffect(() => {
+    publishFormSave(id, { status: autosave.status, detail: autosave.detail });
+  }, [id, autosave.status, autosave.detail]);
+  const shownSave = useCombinedSave(id);
+  const status = shownSave.status;
+  const statusDetailText = shownSave.detail;
 
   // --- Crash recovery: work the backup caught that never reached the server --
   const [recovery, setRecovery] = useState<EditorSnapshot | null>(null);
@@ -596,7 +617,7 @@ export function FormEditor({
       const { [oldKey]: _moved, ...rest } = prev;
       return { ...rest, [nextKey]: held };
     });
-    void callAction(() => renameQuestionMappingAction(id, oldKey, nextKey)).then((res) => {
+    void runDestinationWrite(id, () => callAction(() => renameQuestionMappingAction(id, oldKey, nextKey))).then((res) => {
       if (isTransportError(res) || (!res.ok && res.code === 'error')) {
         // The config rename already applied and autosaved; only the CRM mapping
         // is behind. Say so rather than implying the whole rename failed.
@@ -851,15 +872,19 @@ export function FormEditor({
           ? bm.shell.saveError
           : status === 'conflict'
             ? bm.shell.conflict
-            : hasQuestions
-              ? bm.shell.saved
-              : bm.shell.draft;
+            : status === 'partial'
+              ? bm.shell.savedPartial
+              : hasQuestions
+                ? bm.shell.saved
+                : bm.shell.draft;
   const statusDot =
     status === 'error' || status === 'conflict'
       ? 'bg-destructive'
-      : status === 'saving' || status === 'retrying'
-        ? 'bg-muted-foreground'
-        : 'bg-signal-edge';
+      : status === 'partial'
+        ? 'bg-warning'
+        : status === 'saving' || status === 'retrying'
+          ? 'bg-muted-foreground'
+          : 'bg-signal-edge';
   /** Kept for tests/tools reading `data-status`: an empty saved form is "draft". */
   const displayStatus = status === 'saved' && !hasQuestions ? 'draft' : status;
 
@@ -886,7 +911,11 @@ export function FormEditor({
   );
 
   return (
-    <div className="flex h-[100dvh] flex-col overflow-hidden bg-background">
+    // Fills what the admin shell leaves it (`flex-1 min-h-0` in a one-screen
+    // column <main>), never the viewport: the referral banner and, below
+    // 768px, the mobile top bar sit above it, and a `100dvh` builder would
+    // push its bottom edge that far off screen.
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
       {/* Topbar: one row from `lg` up, two below it.
           Four pieces: the form (back, name, publish state), the sections, the
           sharing tools, and Publish. From `lg` they sit in one row with the
@@ -962,6 +991,7 @@ export function FormEditor({
             >
               <i aria-hidden className={`pi ${t.icon} md:!hidden`} style={{ fontSize: 14 }} />
               <span className="sr-only md:not-sr-only">{t.label}</span>
+              {t.id === 'connect' ? <ConnectTabMark formId={id} /> : null}
             </button>
           ))}
           {/* The responses this form has collected. Not an editor section: it
@@ -986,14 +1016,16 @@ export function FormEditor({
           <span
             className={cn(
               'hidden shrink-0 items-center gap-1.5 text-xs text-muted-foreground xl:inline-flex',
-              (status === 'error' || status === 'retrying') && autosave.detail ? 'cursor-help' : '',
+              (status === 'error' || status === 'retrying' || status === 'partial') && statusDetailText ? 'cursor-help' : '',
             )}
             data-testid="editor-save-status"
             data-status={displayStatus}
             // Native tooltip: hover the "Not saved" indicator to read WHY it failed.
             title={
-              (status === 'error' || status === 'retrying') && autosave.detail
-                ? tb(m.saveErrorReason, { reason: autosave.detail })
+              (status === 'error' || status === 'retrying' || status === 'partial') && statusDetailText
+                ? status === 'partial'
+                  ? statusDetailText
+                  : tb(m.saveErrorReason, { reason: statusDetailText })
                 : undefined
             }
           >
@@ -1057,6 +1089,12 @@ export function FormEditor({
               formId={id}
               initialHasDraft={initialHasDraft}
               saveCount={saveCount}
+              // The DRAFT's own save state, not the combined one the indicator
+              // above shows: integrations save straight to the live form and are
+              // not part of what Publish publishes, so their state (a webhook
+              // with no URL is a standing `partial`) must not hold the pill.
+              saveStatus={autosave.status}
+              hasQuestions={hasQuestions}
               locale={locale}
               flush={autosave.flush}
               getSaveCount={() => saveCountRef.current}
@@ -1394,6 +1432,7 @@ export function FormEditor({
                     status: attributionStatus,
                     canEdit: attribution.canEdit,
                     daptaAiUrl: attribution.daptaAiUrl,
+                    referral: attribution.referral ?? null,
                     onChange: setAttributionStatus,
                   }
                 : null

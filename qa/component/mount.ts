@@ -1,0 +1,184 @@
+import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { build, type Plugin } from 'esbuild';
+import type { Page } from '@playwright/test';
+
+/**
+ * Mounts real admin components in a blank page, with the app's real CSS.
+ *
+ * The page is built from two artifacts, both made from the source tree on the
+ * first call and reused for the rest of the run:
+ *
+ *  - the JS: `entry.tsx` bundled with esbuild, which follows the imports into
+ *    `apps/web` and so ships the component under test exactly as written;
+ *  - the CSS: `apps/web/app/globals.css` run through the app's own Tailwind
+ *    PostCSS plugin, the same input and the same plugin `next build` uses.
+ *
+ * So a spec measures what a browser does with the shipped component and the
+ * shipped utilities, and needs no API, no database and no port. The one thing
+ * it does need is the workspace packages built (`pnpm build:packages`, which
+ * `pnpm qa:component` runs first): `@quill/shared` resolves to its `dist/`.
+ *
+ * What it does NOT get is the app's web font: text is set in the fallback face,
+ * so specs must assert on relations (inside this box, same width as before),
+ * never on a pixel count that depends on glyph widths.
+ */
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repo = path.resolve(here, '../..');
+const web = path.join(repo, 'apps/web');
+
+// Tailwind and PostCSS are the web app's dependencies, not the repo root's.
+// Resolving them through the app is what guarantees this is the plugin (and the
+// version) that compiles the real stylesheet, rather than a second copy pinned
+// here that could drift from it.
+const webRequire = createRequire(path.join(web, 'package.json'));
+const tailwindPath = webRequire.resolve('@tailwindcss/postcss');
+
+async function compileCss(): Promise<string> {
+  const tailwind = webRequire('@tailwindcss/postcss') as (options: { base: string }) => unknown;
+  const postcss = createRequire(tailwindPath)('postcss') as (plugins: unknown[]) => {
+    process: (css: string, options: { from: string }) => Promise<{ css: string }>;
+  };
+  const from = path.join(web, 'app/globals.css');
+  // `base` is where Tailwind looks for class names. Next runs the plugin from
+  // `apps/web`, so that is what makes the utilities here the app's own set: a
+  // class the app does not use does not exist in this page either.
+  const result = await postcss([tailwind({ base: web })]).process(await readFile(from, 'utf8'), { from });
+  return result.css;
+}
+
+/**
+ * Modules a blank page cannot run, swapped for the stand-ins in `stubs/`:
+ * `next/navigation` needs the App Router, a `'use server'` actions file
+ * needs a server, and `node:crypto` needs Node. Matched by import path, so the component under test is
+ * still bundled exactly as written.
+ */
+const stubs: Plugin = {
+  name: 'qa-stubs',
+  setup(b) {
+    b.onResolve({ filter: /^next\/navigation$/ }, () => ({ path: path.join(here, 'stubs/next-navigation.ts') }));
+    b.onResolve({ filter: /^next\/link$/ }, () => ({ path: path.join(here, 'stubs/next-link.tsx') }));
+    b.onResolve({ filter: /^node:crypto$/ }, () => ({ path: path.join(here, 'stubs/node-crypto.ts') }));
+    // Only the Connections page's actions have a stand-in; any other
+    // `./actions` fails loudly rather than bundling a server module.
+    b.onResolve({ filter: /^\.\/actions$/ }, (args) => {
+      if (!/admin[\\/]integrations$/.test(args.resolveDir)) {
+        return { errors: [{ text: `qa/component has no stub for ./actions in ${args.resolveDir}` }] };
+      }
+      return { path: path.join(here, 'stubs/integration-actions.ts') };
+    });
+  },
+};
+
+/**
+ * True when the first statement of `source`, after whitespace and comments,
+ * is the `'use server'` directive. A plain scan instead of one regex with
+ * nested repetition, which can backtrack badly on unusual input.
+ */
+function startsWithUseServer(source: string): boolean {
+  let i = 0;
+  while (i < source.length) {
+    if (/\s/.test(source[i]!)) {
+      i += 1;
+    } else if (source.startsWith('//', i)) {
+      const end = source.indexOf('\n', i);
+      if (end === -1) return false;
+      i = end + 1;
+    } else if (source.startsWith('/*', i)) {
+      const end = source.indexOf('*/', i + 2);
+      if (end === -1) return false;
+      i = end + 2;
+    } else {
+      break;
+    }
+  }
+  return /^['"]use server['"]/.test(source.slice(i, i + 12));
+}
+
+/**
+ * Any other `'use server'` module (the shell's theme, sign-out and workspace
+ * actions) becomes a module whose exported functions throw when called. The
+ * export names are read from the file, so a component that imports an action
+ * still bundles; a layout spec never invokes one.
+ */
+const serverActions: Plugin = {
+  name: 'qa-server-actions',
+  setup(b) {
+    b.onLoad({ filter: /apps[\\/]web[\\/].*\.ts$/ }, async (args) => {
+      const source = await readFile(args.path, 'utf8');
+      // The directive may sit under a doc comment (`app/login/actions.ts` does).
+      if (!startsWithUseServer(source)) return undefined;
+      const names = [...source.matchAll(/^export async function (\w+)/gm)].map((m) => m[1]);
+      const body = names.map((n) => `export const ${n} = never;`).join('\n');
+      return {
+        contents: `const never = async () => { throw new Error('server actions are not available in qa/component'); };\n${body}`,
+        loader: 'ts',
+      };
+    });
+  },
+};
+
+/**
+ * A component's own stylesheet (`import './agent-promo.css'`) is injected as a
+ * `<style>` tag when the bundle runs. Next would ship it in the page's CSS; a
+ * blank page only has the compiled globals, and the Home card's animations
+ * live in its own file.
+ */
+const componentCss: Plugin = {
+  name: 'qa-component-css',
+  setup(b) {
+    b.onLoad({ filter: /\.css$/ }, async (args) => {
+      const css = await readFile(args.path, 'utf8');
+      return {
+        contents: `const s = document.createElement('style'); s.textContent = ${JSON.stringify(css)}; document.head.appendChild(s);`,
+        loader: 'js',
+      };
+    });
+  },
+};
+
+async function compileJs(): Promise<string> {
+  const result = await build({
+    plugins: [stubs, serverActions, componentCss],
+    entryPoints: [path.join(here, 'entry.tsx')],
+    bundle: true,
+    write: false,
+    format: 'iife',
+    platform: 'browser',
+    jsx: 'automatic',
+    // The `@/` alias, and React resolved from the app (the entry lives outside it).
+    tsconfig: path.join(web, 'tsconfig.json'),
+    nodePaths: [path.join(web, 'node_modules')],
+    define: { 'process.env.NODE_ENV': '"production"' },
+    // `lib/suite.ts` and `lib/product-name.ts` read `NEXT_PUBLIC_*` at module
+    // scope, which Next inlines at build time. Unset here, so they take their
+    // defaults, exactly as a deployment without those variables does.
+    banner: { js: 'var process = { env: {} };' },
+    logLevel: 'silent',
+  });
+  return result.outputFiles[0]!.text;
+}
+
+let assets: Promise<{ css: string; js: string }> | undefined;
+
+/**
+ * Replace the page with `body` (plain HTML scaffolding) and mount a component
+ * into every placeholder it contains. See `entry.tsx` for the placeholders.
+ *
+ * Scaffolding may use any utility class the app already uses, since those are
+ * in the compiled sheet; anything else needs an inline style.
+ */
+export async function mount(page: Page, body: string, theme: 'light' | 'dark' = 'light'): Promise<void> {
+  assets ??= Promise.all([compileCss(), compileJs()]).then(([css, js]) => ({ css, js }));
+  const { css, js } = await assets;
+  await page.setContent(
+    `<!doctype html><html lang="en" data-theme="${theme}"><head><meta charset="utf-8">` +
+      `<meta name="viewport" content="width=device-width, initial-scale=1"></head><body>${body}</body></html>`,
+  );
+  await page.addStyleTag({ content: css });
+  await page.addScriptTag({ content: js });
+  await page.waitForFunction(() => document.documentElement.dataset.mounted === 'true');
+}

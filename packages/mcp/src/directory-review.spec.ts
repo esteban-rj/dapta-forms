@@ -78,6 +78,8 @@ describe('connector directory review', () => {
         'delete_link_page',
         'duplicate_form',
         'list_calendly_event_types',
+        'list_event_types',
+        'list_gohighlevel_fields',
         'list_hubspot_properties',
         'ping_webhook',
         'publish_form',
