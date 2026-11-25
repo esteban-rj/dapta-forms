@@ -213,6 +213,8 @@ loud** on a bad value. Copy [`.env.example`](.env.example) to `.env` to override
 | `OUTBOX_MAX_ATTEMPTS` | `5` | — | no |
 | `ONBOARDING_WIZARD` | `true` | set `false` to skip the first-run wizard (and get `SEED_DEMO_FORM` back) | no |
 | `SEED_DEMO_FORM` | `true` | **inert while `ONBOARDING_WIZARD` is on**; set `false` to ship empty new workspaces | no |
+| `REFERRAL_PROGRAM` | unset: on with the identity service (`AUTH_PROVIDER=workos` + `IAM_BASE_URL`), else off | set `true` to give every signed-in person a referral link in the left menu. It links to `NEXT_PUBLIC_LANDING_URL`, else `PUBLIC_APP_URL`, and stays off with neither; the API builds the link, so `NEXT_PUBLIC_LANDING_URL` must be in the API's runtime env too, not only a web build arg. Read by the API only; the web app takes it from `/v1/me`. A landing on another origin that greets invitees by name (`GET /v1/public/referrals/{code}`) from the browser must be listed in `CORS_ORIGINS`; a same-origin proxy needs no entry. Setting it back to `false` is the kill switch: the menu, banner, claims and name lookup stop, earned unlocks stay. Launch steps: [docs/referral-program-launch.md](docs/referral-program-launch.md) | no |
+| `REFERRAL_CAMPAIGN_ENDS_AT` | unset (no end) | an ISO 8601 date-time with a time zone, e.g. `2026-12-31T23:59:59Z`, when the referral campaign ends. After it the top banner and the reminder email stop; the link, the count, the menu entry and earned unlocks stay. Any other value refuses to boot. Read by the API only; the web app takes `campaignActive` from `/v1/me` | no |
 
 The two form-seeding knobs are mutually exclusive by construction. A new
 workspace gets exactly one of: the wizard's chosen template (`ONBOARDING_WIZARD`
@@ -321,6 +323,13 @@ date, or a sunset before the deprecation refuses to boot.
 | Var | Default | Required when | Secret |
 |---|---|---|---|
 | `HUBSPOT_PRIVATE_APP_TOKEN` | _(unset)_ | to enable the HubSpot destination (else it reports a disabled state) | yes |
+| `DCAL_API_BASE_URL` | _(unset)_ | to offer dCal as a scheduler (needs `DCAL_APP_URL` too) | no |
+| `DCAL_APP_URL` | _(unset)_ | to offer dCal as a scheduler (needs `DCAL_API_BASE_URL` too) | no |
+| `GOOGLE_OAUTH_CLIENT_ID` | _(unset)_ | to offer Google Sheets as a destination: the OAuth client you register in Google Cloud (a "Web application" client, Google Sheets API enabled), set together with the secret and the redirect URI, and with `FORMS_ENCRYPTION_KEY`. Missing (or any of the three missing): Google Sheets is not offered anywhere, `GET /v1/integrations` lists it in `unavailable`, an API key or MCP agent's new spreadsheet destination is refused with `INTEGRATION_NOT_CONNECTED` and `unavailable: true`, and a spreadsheet destination saved earlier delivers nothing | no |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | _(unset)_ | with `GOOGLE_OAUTH_CLIENT_ID`; missing has the same effect as a missing client id | yes |
+| `GOOGLE_OAUTH_REDIRECT_URI` | _(unset)_ | with `GOOGLE_OAUTH_CLIENT_ID`: this API's own `/v1/integrations/google-sheets/callback`, character for character the one on the client. Missing has the same effect as a missing client id; one that does not match makes Google refuse the consent screen | no |
+| `GOOGLE_PICKER_API_KEY` | _(unset)_ | optional, with Google Sheets on: lets an author write into a spreadsheet that already exists, chosen with the Google Picker (enable the Google Picker API in the same project; a browser key restricted by HTTP referrer to the web app's origin, which reaches the browser by design). Missing: authors can only create a new spreadsheet from the form, and `GET /v1/integrations` answers `googlePicker: false` | no |
+| `GOOGLE_PICKER_APP_ID` | _(read off `GOOGLE_OAUTH_CLIENT_ID`)_ | the Cloud project NUMBER, when the client id does not start with it. Missing and not readable off the client id: the same as a missing picker key | no |
 
 Webhook destinations are configured **per form in the admin UI** (URL + optional
 HMAC secret) — no environment variable.
@@ -508,6 +517,64 @@ through the same outbox with retry + backoff).
 - **HubSpot** — set `HUBSPOT_PRIVATE_APP_TOKEN` (server-side). Unset = the HubSpot
   destination and its property picker report a clear disabled state, so a
   webhook-only deployment needs nothing here.
+
+### Salesforce (optional)
+
+A form can send each completed response to a Salesforce org. There is nothing
+to set on the server beyond `FORMS_ENCRYPTION_KEY`, which already stores every
+connection: each workspace connects its own org from the Connections page with
+three values from an External Client App (the org's My Domain, the consumer key
+and the consumer secret) using the Client Credentials Flow. They are stored
+encrypted and proved against Salesforce before they are saved.
+
+The API sends the consumer secret only to the org's own My Domain
+(`*.my.salesforce.com`), and then writes to the instance URL Salesforce returns
+with the token, always a `*.salesforce.com` or `*.force.com` host. An egress
+allowlist needs those Salesforce hosts. A delivery looks the
+respondent up by email first and updates an existing Contact or Lead before it
+creates a new Lead.
+
+### HighLevel (optional)
+
+A form can send each response to a HighLevel (GoHighLevel) sub-account as a
+contact. There are no new environment variables: like Salesforce, it only needs
+`FORMS_ENCRYPTION_KEY`. An owner or admin connects one sub-account per
+workspace from the Connections page by pasting a Private Integration token of
+the sub-account (it starts with `pit-`) and its Location ID; both are proved
+against HighLevel before the token is stored encrypted. Agents never connect
+it: the MCP tools and the public API only read whether it is connected
+(`list_integrations`) and its fields (`list_gohighlevel_fields`,
+`GET /v1/integrations/gohighlevel/fields`), and a destination saved by an agent
+while it is not connected is refused with `INTEGRATION_NOT_CONNECTED` and the
+Connections page.
+
+The API calls only `services.leadconnectorhq.com`, which an egress allowlist
+needs. A delivery upserts the contact (HighLevel deduplicates it by email or
+phone, as the sub-account's duplicate rules say), then adds the destination's
+tags.
+
+### dCal as a scheduler (optional)
+
+A scheduler question can embed a [dCal](https://github.com/Dapta-Tech/dapta-calendars-slate)
+booking page instead of Calendly. Set **both** `DCAL_API_BASE_URL` (the dCal API
+the Forms API calls, server-side) and `DCAL_APP_URL` (the dCal app the visitor's
+browser reaches). With only the first, every booking URL the picker builds would
+be relative and the author's save would fail validation, so the picker reports a
+disabled state instead of offering event types that cannot be saved.
+
+There is no token here. The picker forwards the signed-in author's own session
+to dCal, so each author sees exactly the event types they can already see there,
+and a deployment whose sign-in is the local provider cannot offer dCal at all
+(no session to forward). Both values are read at runtime, so the same web image
+serves every environment.
+
+A dCal step prefills the booking form from answers the visitor already gave, so
+the booking page receives a name and an address in its query string. dCal strips
+them from the address bar before any analytics tag on that page reads the URL.
+
+If a proxy in front of the web app adds a Content-Security-Policy, allow the
+`DCAL_APP_URL` host in `frame-src`: the booking page is embedded in an iframe,
+in the public form and in the builder's canvas.
 
 ## Upgrades & rollback
 

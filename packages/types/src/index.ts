@@ -33,9 +33,15 @@ import {
   isSafeImageUrl,
 } from '@quill/engine';
 import { submissionVisitSchema, submissionVisitViewSchema } from './submission-visit';
+import {
+  GOHIGHLEVEL_CUSTOM_FIELD_DATA_TYPES,
+  GOHIGHLEVEL_STANDARD_FIELD_KEYS,
+  GOHIGHLEVEL_UTM_KEYS,
+} from './gohighlevel';
 
 export * from './submission-visit';
 export * from './link-page';
+export * from './gohighlevel';
 
 /** A URL rendered into `<img src>` — reject script protocols (XSS defense-in-depth). */
 const safeImageUrl = z
@@ -195,9 +201,19 @@ export const formRevealSchema = z.object({
  * exactly like any other step. All fields optional/additive (back-compat).
  */
 export const formSchedulerSchema = z.object({
-  /** Scheduling provider. v1 ships Calendly; the embed also supports HubSpot Meetings. */
-  provider: z.enum(['calendly', 'hubspot_meetings']).optional(),
-  /** The picked Calendly event type's stable URI (used by the builder's picker). */
+  /**
+   * Scheduling provider. v1 shipped Calendly; the embed also supports HubSpot
+   * Meetings and dCal (Dapta's own scheduler).
+   */
+  // Spelled out rather than `z.enum(bookingProvider)`: that const is declared
+  // further down this file, and a forward reference here is evaluated at import
+  // time, before it exists. The two lists must move together.
+  provider: z.enum(['calendly', 'hubspot_meetings', 'dcal']).optional(),
+  /**
+   * The picked event type's stable id, used by the builder's picker: Calendly's
+   * URI, or dCal's own event-type id. Not a URL on purpose, because neither
+   * provider's id is one.
+   */
   eventTypeUri: z.string().max(500).nullable().optional(),
   /** Its display name, stored so the builder can label it without a lookup. */
   eventTypeName: z.string().max(200).nullable().optional(),
@@ -500,8 +516,15 @@ export type BrandKit = z.infer<typeof brandKitSchema>;
 
 // --- Outcome extensions (booking + answer-forced overrides) ------------------
 
-/** Scheduling providers an outcome can hand off to after the form completes. */
-export const bookingProvider = ['hubspot_meetings', 'calendly'] as const;
+/**
+ * Scheduling providers an outcome can hand off to after the form completes.
+ *
+ * `dcal` is Dapta's own scheduler (dforms' sibling product). It needs no
+ * connected credential at all, unlike the other two: it projects the SAME
+ * identity service this app does, so the author's own session is what lists
+ * their event types, and the booking page it embeds is a plain URL.
+ */
+export const bookingProvider = ['hubspot_meetings', 'calendly', 'dcal'] as const;
 export type BookingProvider = (typeof bookingProvider)[number];
 
 /**
@@ -598,7 +621,7 @@ export const formOutcomeSchema = z.object({
 // --- Submission destinations (pluggable CRM / webhook sync) ------------------
 
 /** The configurable destination kinds a form may deliver submissions to. */
-export const destinationType = ['webhook', 'hubspot'] as const;
+export const destinationType = ['webhook', 'hubspot', 'google-sheets', 'salesforce', 'gohighlevel'] as const;
 export type DestinationType = (typeof destinationType)[number];
 
 /** A property map: form stepKey / utmKey -> external property name. */
@@ -680,32 +703,100 @@ export const webhookDestinationSchema = z.object({
 });
 export type WebhookDestination = z.infer<typeof webhookDestinationSchema>;
 
+/**
+ * Whether a stored destination can deliver anything at all.
+ *
+ * A Google Sheets destination is stored while the author is still setting it
+ * up (switched on, no spreadsheet yet, or no complete column), so their work
+ * survives a reload. Such a destination is skipped at enqueue time rather
+ * than handed to an adapter that could only record a no-op for every
+ * submission. Every other type is deliverable as stored.
+ */
+export function destinationIsDeliverable(destination: {
+  type: string;
+  settings?: unknown;
+  columns?: unknown;
+}): boolean {
+  if (destination.type !== 'google-sheets') return true;
+  const settings = (destination.settings ?? {}) as { spreadsheetId?: unknown };
+  if (typeof settings.spreadsheetId !== 'string' || !settings.spreadsheetId.trim()) return false;
+  const columns = Array.isArray(destination.columns) ? destination.columns : [];
+  return columns.some(
+    (c) => typeof c === 'object' && c !== null && isWritableSheetColumn(c as { header?: string }),
+  );
+}
+
 /** Submission phases a destination can subscribe to. */
 export const destinationEvents = ['partial', 'complete'] as const;
 export type DestinationEvent = (typeof destinationEvents)[number];
 
 /**
- * Resolve whether a destination should fire for a given phase. Absent/empty
- * `events` = both phases (back-compat). Only webhook destinations carry an
- * `events` filter today; others always fire (their adapters gate internally).
+ * The CRM destinations whose ABSENT `events` means complete-only.
+ *
+ * Salesforce was complete-only before `events` existed on it, for a reason of
+ * its own: a partial carries whatever the respondent typed so far, and the
+ * CREATE path has to invent a last name and a company for a Lead that lacks
+ * them, so a partial would mint a placeholder record for every visitor who
+ * typed an email and left. Every Salesforce config stored before the switch
+ * has no `events`, and must keep behaving exactly as it did. HighLevel starts
+ * the same way: partials are something the author turns on.
+ */
+const COMPLETE_ONLY_BY_DEFAULT: ReadonlySet<string> = new Set(['salesforce', 'gohighlevel']);
+
+/**
+ * Resolve whether a destination should fire for a given phase.
+ *
+ *   google-sheets            complete only, whatever `events` says
+ *   salesforce, gohighlevel  `events` absent or empty: complete only
+ *   webhook, hubspot         `events` absent or empty: both (back-compat)
+ *   any of the last four     an explicit `events` is respected as written
+ *
+ * The CRM cards write `events` explicitly when the author touches the
+ * "send partial responses too" switch, so a stored config without it always
+ * means the default of its kind.
  */
 export function destinationFiresForPhase(
   destination: { type: string; events?: DestinationEvent[] | undefined },
   phase: DestinationEvent,
 ): boolean {
+  // A spreadsheet is APPEND-ONLY, which makes a partial a different thing here
+  // than it is anywhere else. A webhook receiving a partial and then the
+  // complete can reconcile them on its own key; a CRM upserts onto the same
+  // contact. A sheet cannot: it would hold one row from halfway through the
+  // form and a second, fuller row underneath, with nothing in either saying
+  // they are the same person. So this destination is complete-only, and it is
+  // decided here rather than left to a default, because the schema's absent
+  // `events` means BOTH and that default is wrong for exactly this kind.
+  if (destination.type === 'google-sheets') return phase === 'complete';
   const events = destination.events;
-  if (!events || events.length === 0) return true;
+  if (!events || events.length === 0) {
+    return COMPLETE_ONLY_BY_DEFAULT.has(destination.type) ? phase === 'complete' : true;
+  }
   return events.includes(phase);
 }
+
+/**
+ * The submission phases a CRM destination listens to (additive). Absent means
+ * the default of its kind (see `destinationFiresForPhase`): both for HubSpot,
+ * complete only for Salesforce and HighLevel.
+ */
+const crmEventsSchema = z.array(z.enum(['partial', 'complete'])).optional();
 
 /**
  * HubSpot destination — upsert the respondent as a contact and (on complete)
  * attach a Note. The private-app token is a server-side env secret
  * (`HUBSPOT_PRIVATE_APP_TOKEN`), NOT stored in the form config.
  */
+/** Bounds for the unfinished rows a CRM destination keeps (`drafts`). */
+const DRAFT_ROWS = 200;
+const draftText = z.string().max(200);
+const draftValue = z.string().max(500);
+
 export const hubspotDestinationSchema = z.object({
   type: z.literal('hubspot'),
   enabled: z.boolean().default(false),
+  /** Which phases sync (additive). Absent = both, as before the switch existed. */
+  events: crmEventsSchema,
   settings: z
     .object({
       note: z.boolean().optional(),
@@ -772,6 +863,27 @@ export const hubspotDestinationSchema = z.object({
   outcomeProperty: z.string().max(200).nullable().optional(),
   /** Fixed property values stamped on every synced contact. */
   staticProperties: z.record(z.string().min(1).max(200), z.string().max(500)).optional(),
+  /**
+   * Rows the author started on the Connect tab and has not finished (a key
+   * with no property yet, a fixed value with no property, a value-map row with
+   * one side empty). Stored so they survive a reload; never read by a delivery
+   * or the mirror form, which see only the complete mappings above.
+   */
+  drafts: z
+    .object({
+      mappings: z.array(z.object({ key: draftText, property: draftText })).max(DRAFT_ROWS).optional(),
+      statics: z.array(z.object({ key: draftText, value: draftValue })).max(DRAFT_ROWS).optional(),
+      valueMaps: z
+        .array(
+          z.object({
+            stepKey: draftText,
+            rows: z.array(z.object({ from: draftValue, to: draftValue })).max(DRAFT_ROWS),
+          }),
+        )
+        .max(DRAFT_ROWS)
+        .optional(),
+    })
+    .optional(),
   /** Derive the company name from the respondent's email domain. */
   inferCompanyFromEmail: z.boolean().optional(),
   /**
@@ -805,9 +917,452 @@ export const hubspotDestinationSchema = z.object({
 });
 export type HubspotDestination = z.infer<typeof hubspotDestinationSchema>;
 
+/**
+ * What fills ONE cell of a spreadsheet row.
+ *
+ * `answer` names a step by its key; `utm` names one of the five campaign keys;
+ * the rest take no key. Unlike a CRM mapping, which is a record keyed by the
+ * question, this is a LIST: a spreadsheet's columns are ordered, and the order
+ * is the author's to choose rather than whatever a record happens to iterate in.
+ */
+export const sheetColumnSource = [
+  'answer',
+  'utm',
+  'score',
+  'outcome',
+  'submitted_at',
+  'form_name',
+  'submission_id',
+] as const;
+export type SheetColumnSource = (typeof sheetColumnSource)[number];
+
+export const sheetColumnSchema = z.object({
+  /**
+   * The text in the header row. Stored rather than derived, because the author
+   * can rename a column without the question changing, and because a sheet that
+   * already has data must keep the heading its existing rows were written under.
+   *
+   * May be empty: a column the author has added but not named yet is stored
+   * as it is, so it survives a reload, and is left out of the sheet (row 1 and
+   * every delivered row alike) until it has a heading. See
+   * `isWritableSheetColumn`.
+   */
+  header: z.string().max(200),
+  source: z.enum(sheetColumnSource),
+  /** The step key (`answer`) or the campaign key (`utm`). Unused by the rest. */
+  key: z.string().min(1).max(64).optional(),
+});
+export type SheetColumn = z.infer<typeof sheetColumnSchema>;
+
+/**
+ * A column that goes into the sheet: one with a heading. Nothing else.
+ *
+ * The ONE rule for which columns exist in the sheet and in what order, used
+ * by the header row, every delivered row, the create call, the editor's
+ * column letters and `destinationIsDeliverable`, so all of them always agree.
+ * A heading with no answer chosen yet is written (its heading in row 1, an
+ * empty cell in every row) rather than skipped: skipping it would shift every
+ * column after it the moment the answer is picked. This is also what every
+ * config written before the rule existed meant by `{header, source:'answer'}`
+ * with no key. A column with no heading has nothing to put in row 1, so it is
+ * stored (the author's work survives a reload) and not written.
+ */
+export function isWritableSheetColumn(column: { header?: string; source?: string; key?: string }): boolean {
+  return !!column.header?.trim();
+}
+
+/** The columns that go into the sheet, in order. */
+export function writableSheetColumns<T extends { header?: string; source?: string; key?: string }>(
+  columns: readonly T[] | undefined,
+): T[] {
+  return (columns ?? []).filter(isWritableSheetColumn);
+}
+
+/** One cell position of the sheet: the column behind it and the heading row 1 holds there. */
+export interface SheetCell<T> {
+  column: T;
+  /** The heading in row 1 at this position. */
+  header: string;
+  /**
+   * The column has no heading right now, but dForms wrote one at this position
+   * before: the position is HELD (row 1 keeps the old heading, the cell is
+   * delivered empty) so the columns after it do not shift.
+   */
+  held: boolean;
+}
+
+/**
+ * The cells of one sheet row, in order: `writableSheetColumns`, plus the
+ * positions a column with a cleared heading still holds.
+ *
+ * `written` is the row 1 dForms has on record for the SAME spreadsheet and
+ * tab (see `writtenSheetHeaders`). Without it this is exactly
+ * `writableSheetColumns`.
+ *
+ * Why positions are held: an author renaming column B clears its heading
+ * first. Dropping the column at that moment moved every later column one cell
+ * to the left, for row 1 and for any response delivered before the new name
+ * was typed. A column that stands at a position `written` covers keeps it
+ * instead: row 1 is left alone there and its cell is delivered empty, until
+ * the column gets a heading again or is deleted for real. A column that never
+ * had a heading holds nothing and stays out, as before.
+ *
+ * WHICH unnamed column holds a position is decided by POSITION, not by
+ * reading headings ahead. The columns are laid over `written` left to right:
+ * a named column takes the next position, an unnamed one either holds the
+ * next position or is not in the sheet at all. Of all the ways to do that,
+ * the one that changes the sheet least is taken, counting:
+ *   - a named column whose position holds a different heading in `written`
+ *     (it was renamed or moved): one change;
+ *   - a position of `written` no column stands on any more (its column was
+ *     deleted): one change;
+ *   - a named column past the end of `written` (appended): no change.
+ * On a tie the unnamed column is left out, which is what a column that was
+ * added and never named should be.
+ *
+ * Comparing by position is what makes two identical headings side by side
+ * work. `[A, X, X]` with the first X cleared is `[A, _, X]`: looking ahead by
+ * text saw "the next heading is X, and so is this position" and took the
+ * cleared column for a new one, so row 1 was rewritten and the third column
+ * moved. By position, holding it leaves every column where it was (no
+ * change), and dropping it leaves a written position with no column (one
+ * change), so it is held.
+ *
+ * THE LIMIT. Columns have no identity beyond their place in the list, so an
+ * edit that both moves columns and clears a heading before it is saved can
+ * only be read as the smallest change that explains it. Whatever is chosen,
+ * this function is the single answer: row 1, every delivered row and the
+ * card's letters are all built from it, so they agree with each other even
+ * then.
+ */
+export function sheetCells<T extends { header?: string; source?: string; key?: string }>(
+  columns: readonly T[] | undefined,
+  written?: readonly string[] | null,
+): SheetCell<T>[] {
+  const list = columns ?? [];
+  const named = list.map((c) => isWritableSheetColumn(c));
+  if (!written?.length || named.every(Boolean)) {
+    return list
+      .filter((_, i) => named[i])
+      .map((column) => ({ column, header: column.header!.trim(), held: false }));
+  }
+  const n = list.length;
+  const w = written.length;
+  // cost[i][p]: the least change for columns i.. when p positions are taken.
+  // holds[i][p]: whether unnamed column i holds position p in that best case.
+  const cost: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(n + 1).fill(0));
+  const holds: boolean[][] = Array.from({ length: n }, () => new Array<boolean>(n + 1).fill(false));
+  for (let p = 0; p <= n; p++) cost[n]![p] = Math.max(0, w - p);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let p = 0; p <= i; p++) {
+      if (named[i]) {
+        const moved = p < w && written[p] !== list[i]!.header!.trim() ? 1 : 0;
+        cost[i]![p] = moved + cost[i + 1]![p + 1]!;
+        continue;
+      }
+      const out = cost[i + 1]![p]!;
+      const held = p < w ? cost[i + 1]![p + 1]! : Number.POSITIVE_INFINITY;
+      holds[i]![p] = held < out;
+      cost[i]![p] = Math.min(out, held);
+    }
+  }
+  const cells: SheetCell<T>[] = [];
+  for (let i = 0; i < n; i++) {
+    const column = list[i]!;
+    const p = cells.length;
+    if (named[i]) cells.push({ column, header: column.header!.trim(), held: false });
+    else if (holds[i]![p]) cells.push({ column, header: written[p]!, held: true });
+  }
+  return cells;
+}
+
+/**
+ * The row 1 dForms has on record for the spreadsheet and tab this destination
+ * points at, or null when it has none (or has it for another target). Read
+ * from the STORED destination: the API owns these fields.
+ *
+ * That is `headerSnapshot` (what dForms wrote there) or, for a row 1 that is
+ * somebody else's, `headerForeign` (the headings these columns stood for when
+ * dForms found it may not write them). Either one says which positions the
+ * columns occupy, which is all `sheetCells` needs it for.
+ */
+export function writtenSheetHeaders(destination: object | null | undefined): string[] | null {
+  const settings = (destination as { settings?: unknown } | null | undefined)?.settings;
+  if (!settings || typeof settings !== 'object') return null;
+  const { spreadsheetId, sheetTitle, headerSnapshot, headerForeign } = settings as {
+    spreadsheetId?: unknown;
+    sheetTitle?: unknown;
+    headerSnapshot?: unknown;
+    headerForeign?: unknown;
+  };
+  if (typeof spreadsheetId !== 'string' || !spreadsheetId.trim()) return null;
+  const tab = typeof sheetTitle === 'string' ? sheetTitle.trim() : '';
+  for (const recorded of [headerSnapshot, headerForeign]) {
+    if (!recorded || typeof recorded !== 'object') continue;
+    const snap = recorded as { spreadsheetId?: unknown; sheetTitle?: unknown; headers?: unknown };
+    if (snap.spreadsheetId !== spreadsheetId.trim()) continue;
+    if ((typeof snap.sheetTitle === 'string' ? snap.sheetTitle : '') !== tab) continue;
+    if (!Array.isArray(snap.headers)) continue;
+    return snap.headers.filter((h): h is string => typeof h === 'string');
+  }
+  return null;
+}
+
+/**
+ * The row 1 to count a destination's columns against: what dForms has on
+ * record (`writtenSheetHeaders`) or, when it never recorded anything, the
+ * headings of the columns as they are stored now.
+ *
+ * The fallback is for a destination saved before snapshots existed. Its
+ * stored columns ARE what its row 1 was written from, so the first edit made
+ * to it (clearing a middle heading, say) is protected like any later one,
+ * instead of shifting the columns once and being protected from then on.
+ * Null for a destination with no spreadsheet.
+ */
+export function sheetBaselineHeaders(destination: object | null | undefined): string[] | null {
+  const recorded = writtenSheetHeaders(destination);
+  if (recorded) return recorded;
+  const entry = (destination ?? {}) as { settings?: unknown; columns?: unknown };
+  const spreadsheetId = (entry.settings as { spreadsheetId?: unknown } | undefined)?.spreadsheetId;
+  if (typeof spreadsheetId !== 'string' || !spreadsheetId.trim()) return null;
+  const columns = Array.isArray(entry.columns) ? (entry.columns as { header?: unknown }[]) : [];
+  return columns
+    .filter((c) => c && typeof c.header === 'string' && c.header.trim())
+    .map((c) => (c.header as string).trim());
+}
+
+/**
+ * At most this many columns in one row. Well under a sheet's own limit; it
+ * exists so a crafted config cannot make one delivery build an enormous row.
+ */
+export const MAX_SHEET_COLUMNS = 200;
+
+/** Where a spreadsheet destination writes, and a list of row-1 headings there. */
+const sheetHeaderStateSchema = z.object({
+  spreadsheetId: z.string().min(1).max(200),
+  /** `''` is the first tab, the same as an absent `sheetTitle`. */
+  sheetTitle: z.string().max(200),
+  headers: z.array(z.string().max(200)).max(MAX_SHEET_COLUMNS),
+});
+
+/**
+ * Append every submission to a Google Sheet as a new row.
+ *
+ * The credential is NOT here. Like the HubSpot token, it is held per account in
+ * `account_integration` (the OAuth refresh token the consent flow returned) and
+ * exchanged for a short-lived access token by the API at delivery time. Nothing
+ * about Google's client lives in a form's config.
+ */
+export const googleSheetsDestinationSchema = z.object({
+  type: z.literal('google-sheets'),
+  enabled: z.boolean().default(false),
+  settings: z
+    .object({
+      /**
+       * The spreadsheet's own id, as it appears in its URL. Stored rather than
+       * the URL: the URL carries a fragment and query of its own that change as
+       * the author clicks around their own document.
+       */
+      spreadsheetId: z.string().min(1).max(200).nullable().optional(),
+      /** The tab written to, by its visible name. Absent writes to the first tab. */
+      sheetTitle: z.string().max(200).nullable().optional(),
+      // An ABSENT spreadsheet is a destination the author switched on and has
+      // not finished: stored so the switch survives a reload, never delivered
+      // to (see `destinationIsDeliverable`).
+      /**
+       * The header row dForms last wrote (or found already in place), and
+       * where. Bookkeeping the API owns, like HubSpot's `formSignature`: a
+       * caller's copy is discarded on every save and this is set from the
+       * stored row and the Sheets call's result. It is what lets a later edit
+       * to the columns rewrite row 1 while a row 1 that holds anything else
+       * is never touched.
+       */
+      headerSnapshot: sheetHeaderStateSchema.optional(),
+      /**
+       * The headings dForms last found it may NOT write to row 1 (row 1 held
+       * something else), and where. Owned by the API like `headerSnapshot`:
+       * it only spares a sheet a re-read on every unrelated save.
+       */
+      headerForeign: sheetHeaderStateSchema.optional(),
+      /**
+       * The headings whose sync last failed for a reason that will not fix
+       * itself (the spreadsheet is gone, access was revoked, Google is not
+       * connected), and when. API-owned: saves skip Google for these headings
+       * for a while instead of paying a failed call each time.
+       */
+      headerBroken: sheetHeaderStateSchema
+        .extend({ reason: z.string().max(40), at: z.number().int().nonnegative() })
+        .optional(),
+    })
+    .default({}),
+  /**
+   * The row, left to right. Empty means the destination is not configured yet:
+   * the delivery degrades to a no-op rather than inventing a column order.
+   *
+   * Deliberately NOT derived from a submission's own answers at delivery time.
+   * Two respondents answer different optional questions, so a row built from
+   * whatever one of them happened to fill in would put the same question in a
+   * different column on every line, and nothing downstream could read the sheet.
+   */
+  columns: z.array(sheetColumnSchema).max(MAX_SHEET_COLUMNS).default([]),
+});
+export type GoogleSheetsDestination = z.infer<typeof googleSheetsDestinationSchema>;
+
+/**
+ * Salesforce destination: find the respondent by email and write them to the
+ * connected org, without creating a duplicate.
+ *
+ * The connection (My Domain plus an External Client App's consumer key and
+ * secret, Client Credentials Flow) lives in `account_integration`, encrypted,
+ * and is exchanged for an access token by the API at delivery time. Nothing
+ * about the org's credentials lives in a form's config.
+ *
+ * Every mapping names a field of the LEAD object by its API name (`Company`,
+ * `LeadSource`, `Industry__c`). When the email already belongs to a Contact the
+ * delivery updates that Contact instead, writing only the mapped fields that
+ * also exist on Contact, so one Lead-only field cannot fail the whole update.
+ */
+export const salesforceDestinationSchema = z.object({
+  type: z.literal('salesforce'),
+  enabled: z.boolean().default(false),
+  /** Which phases deliver (additive). Absent = complete only, as before the switch existed. */
+  events: crmEventsSchema,
+  /** stepKey -> one Lead field or several (one SHOULD be `Email`). */
+  fieldMappings: fieldMapSchema.default({}),
+  /** utm_source/medium/campaign/term/content -> Lead field. */
+  utmMappings: propertyMapSchema.default({}),
+  /** Lead field to receive the score. */
+  scoreField: z.string().max(200).nullable().optional(),
+  /** Lead date or datetime field to receive the submitted date. */
+  dateField: z.string().max(200).nullable().optional(),
+  /**
+   * The IANA zone that names the CALENDAR DAY when `dateField` is a `date`
+   * field. Blank/absent = UTC. A `datetime` field receives the exact instant.
+   */
+  dayTimezone: z.string().max(64).optional(),
+  /** Fixed values stamped on every record written (e.g. `LeadSource`). */
+  staticFields: z.record(z.string().min(1).max(200), z.string().max(500)).optional(),
+  /**
+   * Rows the author started and has not finished (a question with no field
+   * yet, a fixed value with no field). Stored so they survive a reload; never
+   * read by a delivery, which sees only the complete mappings above.
+   */
+  drafts: z
+    .object({
+      mappings: z.array(z.object({ key: draftText, field: draftText })).max(DRAFT_ROWS).optional(),
+      statics: z.array(z.object({ field: draftText, value: draftValue })).max(DRAFT_ROWS).optional(),
+    })
+    .optional(),
+});
+export type SalesforceDestination = z.infer<typeof salesforceDestinationSchema>;
+
+/** A standard contact field of HighLevel, by its upsert key. */
+const goHighLevelStandardTargetSchema = z.object({
+  kind: z.literal('standard'),
+  field: z.enum(GOHIGHLEVEL_STANDARD_FIELD_KEYS),
+});
+
+/**
+ * A custom field of the location. `dataType` is any type GHL reports, not only
+ * the mappable ones: which type a mapping may target is an AUTHORING rule
+ * (`goHighLevelSlotAccepts`, which the API is to check on save and the adapter
+ * at delivery), so narrowing it later never makes a stored config stop parsing.
+ */
+export const goHighLevelCustomFieldTargetSchema = z.object({
+  kind: z.literal('custom'),
+  /** What the upsert takes. */
+  id: z.string().trim().min(1).max(100),
+  /** GHL's `fieldKey` (`contact.utm_source`), kept to show the row without asking GHL. */
+  key: z.string().max(200),
+  /** The type when it was chosen, kept to validate the row without asking GHL. */
+  dataType: z.enum(GOHIGHLEVEL_CUSTOM_FIELD_DATA_TYPES),
+});
+export type GoHighLevelCustomFieldTarget = z.infer<typeof goHighLevelCustomFieldTargetSchema>;
+
+/** Where one answer goes: a standard field or a custom field. */
+export const goHighLevelFieldTargetSchema = z.discriminatedUnion('kind', [
+  goHighLevelStandardTargetSchema,
+  goHighLevelCustomFieldTargetSchema,
+]);
+export type GoHighLevelFieldTarget = z.infer<typeof goHighLevelFieldTargetSchema>;
+
+/** A constant written on every contact. */
+const goHighLevelStaticFieldSchema = z.object({
+  target: goHighLevelFieldTargetSchema,
+  value: z.string().max(500),
+});
+export type GoHighLevelStaticField = z.infer<typeof goHighLevelStaticFieldSchema>;
+
+/**
+ * HighLevel (GoHighLevel) destination: upsert the respondent as a contact of
+ * the connected sub-account, then add the fixed tags.
+ *
+ * The connection (a Private Integration token and the Location ID) lives in
+ * `account_integration` under the `gohighlevel` provider, encrypted, and is
+ * read by the API at delivery time. Nothing about it lives in a form's config.
+ *
+ * Unlike Salesforce, a mapping target is not a bare name: a standard field and
+ * a custom field are told apart, and a custom field is named by its id (what
+ * the upsert takes) with its key and type kept alongside. The score, the
+ * submitted date and the UTMs go to custom fields only. Which custom-field
+ * types each mapping may target (`goHighLevelSlotAccepts`) and whether a
+ * standard field suits a question's type (`GOHIGHLEVEL_STANDARD_FIELDS`
+ * `sources`) are authoring rules the API is to check on save, not parse
+ * rules, so a stored config keeps parsing if either list changes.
+ *
+ * Precedence when two sources write one field: the mappings, then the UTMs,
+ * then the date and the score; `staticFields` only fill what is still empty.
+ * An empty answer is never sent, so it never clears a value GHL already has.
+ */
+export const goHighLevelDestinationSchema = z.object({
+  type: z.literal('gohighlevel'),
+  enabled: z.boolean().default(false),
+  /** Which phases deliver. Absent = complete only; the card writes it explicitly. */
+  events: crmEventsSchema,
+  /** stepKey -> the fields its answer fills (one question can fill several). */
+  fieldMappings: z
+    .record(z.string().min(1).max(200), z.array(goHighLevelFieldTargetSchema).min(1).max(20))
+    .default({}),
+  /** utm_* -> a text custom field. */
+  utmMappings: z.record(z.enum(GOHIGHLEVEL_UTM_KEYS), goHighLevelCustomFieldTargetSchema).default({}),
+  /** A number custom field to receive the score. */
+  scoreField: goHighLevelCustomFieldTargetSchema.nullable().optional(),
+  /** A date custom field to receive the submitted day. */
+  dateField: goHighLevelCustomFieldTargetSchema.nullable().optional(),
+  /** The IANA zone that names the submitted DAY. Blank/absent = UTC. */
+  dayTimezone: z.string().max(64).optional(),
+  /** Fixed values, each filling its field only when nothing else did. */
+  staticFields: z.array(goHighLevelStaticFieldSchema).max(DRAFT_ROWS).optional(),
+  /** Added to the contact after the upsert; never removes one it already has. */
+  tags: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
+  /** The contact's `source`. Absent or blank: `dForms: {form name}`. */
+  source: z.string().max(200).nullable().optional(),
+  /**
+   * Rows the author started and has not finished (a question with no field
+   * yet, a fixed value with no field). Stored so they survive a reload; never
+   * read by a delivery.
+   */
+  drafts: z
+    .object({
+      mappings: z
+        .array(z.object({ key: draftText, target: goHighLevelFieldTargetSchema.nullable().optional() }))
+        .max(DRAFT_ROWS)
+        .optional(),
+      statics: z
+        .array(z.object({ target: goHighLevelFieldTargetSchema.nullable().optional(), value: draftValue }))
+        .max(DRAFT_ROWS)
+        .optional(),
+    })
+    .optional(),
+});
+export type GoHighLevelDestination = z.infer<typeof goHighLevelDestinationSchema>;
+
 export const formDestinationSchema = z.discriminatedUnion('type', [
   webhookDestinationSchema,
   hubspotDestinationSchema,
+  googleSheetsDestinationSchema,
+  salesforceDestinationSchema,
+  goHighLevelDestinationSchema,
 ]);
 export type FormDestination = z.infer<typeof formDestinationSchema>;
 
@@ -868,6 +1423,67 @@ export function hasExtraHubspotDestination(destinations: unknown, stored?: unkno
   // One is always fine. Past that, only an INCREASE is refused — and an absent
   // or unreadable `stored` counts as zero, so a create refuses anything over one.
   return next > 1 && next > hubspotCount(stored);
+}
+
+/** Rejection message for a second Salesforce destination. */
+export const ONE_SALESFORCE_DESTINATION_MESSAGE =
+  'Only one Salesforce destination per form. Map several fields from the same question instead.';
+
+/** Rejection message for a second HighLevel destination. */
+export const ONE_GOHIGHLEVEL_DESTINATION_MESSAGE =
+  'Only one HighLevel destination per form. Map several fields from the same question instead.';
+
+/**
+ * The destination kinds a form may carry at most one of, each with the
+ * sentence that refuses a second, in the order they are checked. The rule is
+ * {@link hasExtraHubspotDestination}'s, for the same reason: two destinations
+ * writing the same record from one submission race each other, and the editor
+ * only ever shows the first.
+ */
+export const ONE_PER_FORM_DESTINATIONS = {
+  hubspot: ONE_HUBSPOT_DESTINATION_MESSAGE,
+  salesforce: ONE_SALESFORCE_DESTINATION_MESSAGE,
+  gohighlevel: ONE_GOHIGHLEVEL_DESTINATION_MESSAGE,
+} as const satisfies Partial<Record<DestinationType, string>>;
+export type OnePerFormDestinationType = keyof typeof ONE_PER_FORM_DESTINATIONS;
+
+/** How many entries of `type` a (loosely typed) destinations array carries. */
+function countOfType(destinations: unknown, type: string): number {
+  return Array.isArray(destinations) ? destinations.filter((d) => isRecord(d) && d.type === type).length : 0;
+}
+
+/**
+ * True when a proposed destination list would ADD a `type` entry beyond the
+ * first. Only an increase is refused, so a whole-array write that adds nothing
+ * never 400s; an absent or unreadable `stored` counts as zero.
+ */
+export function hasExtraDestinationOfType(
+  type: OnePerFormDestinationType,
+  destinations: unknown,
+  stored?: unknown,
+): boolean {
+  const next = countOfType(destinations, type);
+  return next > 1 && next > countOfType(stored, type);
+}
+
+/**
+ * The first one-per-form rule a proposed list breaks, with its message, or
+ * null. What the write paths call, so a kind added to
+ * {@link ONE_PER_FORM_DESTINATIONS} is enforced everywhere at once.
+ */
+export function extraOnePerFormDestination(
+  destinations: unknown,
+  stored?: unknown,
+): { type: OnePerFormDestinationType; message: string } | null {
+  for (const [type, message] of Object.entries(ONE_PER_FORM_DESTINATIONS) as [OnePerFormDestinationType, string][]) {
+    if (hasExtraDestinationOfType(type, destinations, stored)) return { type, message };
+  }
+  return null;
+}
+
+/** {@link hasExtraDestinationOfType} for Salesforce. */
+export function hasExtraSalesforceDestination(destinations: unknown, stored?: unknown): boolean {
+  return hasExtraDestinationOfType('salesforce', destinations, stored);
 }
 
 /**
@@ -1094,6 +1710,13 @@ export const attributionSchema = z.object({
   /** Path-only entry point (never the query string — it can carry PII). */
   landingPath: z.string().max(512).nullable().optional(),
   /**
+   * The referral code of the referral link the person arrived through (`?ref=`).
+   * Kept here so it rides the same hops as the UTMs; the sign-in callback hands
+   * it to the person-level referral claim, which looks it up and credits the
+   * link's owner. Codes are 8 characters; the cap only bounds a hostile URL.
+   */
+  referralCode: z.string().max(32).nullable().optional(),
+  /**
    * RESERVED — epoch-ms of that first visit, as the CLIENT clock reported it.
    * Structurally unwritable today: `ATTRIBUTION_QUERY_MAP` only carries the
    * string-valued fields, so nothing can populate a number. Kept because the
@@ -1119,6 +1742,12 @@ export const formEndingSchema = z.object({
     .nullable()
     .optional(),
   redirectDelayMs: z.number().int().min(0).max(60_000).optional(),
+  /**
+   * Append the visitor's `utm_*` params to every redirect (the ending's, an
+   * outcome's own and the post-booking one). Absent = off. A `utm_*` key the
+   * owner already wrote into the URL is never overwritten.
+   */
+  forwardUtm: z.boolean().optional(),
 });
 export type FormEndingInput = z.infer<typeof formEndingSchema>;
 
@@ -1549,9 +2178,9 @@ export type FormEventInput = z.infer<typeof formEventSchema>;
 
 /**
  * The public booking callback: the renderer reports a meeting booked through an
- * outcome's scheduling embed (HubSpot Meetings / Calendly) so it can be tied to
- * the session's submission. Persisted as a `booking_event` row; delivery to
- * destinations is a later, outbox-driven concern.
+ * outcome's scheduling embed (HubSpot Meetings / Calendly / dCal) so it can be
+ * tied to the session's submission. Persisted as a `booking_event` row; delivery
+ * to destinations is a later, outbox-driven concern.
  */
 export const bookingCallbackSchema = z.object({
   /** Per-session id (sessionStorage) tying the booking to its submission. */
@@ -1561,6 +2190,18 @@ export const bookingCallbackSchema = z.object({
   eventUri: z.string().url().max(2048).optional(),
   /** Provider URI of the invitee record. */
   inviteeUri: z.string().url().max(2048).optional(),
+  /**
+   * The booking's own identifier, for a provider that names it rather than
+   * addressing it: dCal reports a `uid`, which is what its API reads a booking
+   * back by and what its reschedule and cancel links are built from.
+   *
+   * Kept APART from `eventUri` instead of widening that field, because
+   * `eventUri` is validated as a URL and every reader of it (the HubSpot
+   * booking sync fetches it) treats it as one. A uid in that field would be
+   * either rejected by the schema or fetched as an address, and both are worse
+   * than a second optional field.
+   */
+  bookingUid: z.string().min(1).max(200).optional(),
   /** Scheduled start as an ISO 8601 datetime. */
   startTime: z.string().datetime({ offset: true }).optional(),
 });
@@ -1840,6 +2481,7 @@ const ATTRIBUTION_QUERY_MAP = [
   ['fbclid', 'fbclid', 512],
   ['referrer', 'referrer', 512],
   ['landing_path', 'landingPath', 512],
+  ['ref', 'referralCode', 32],
 ] as const satisfies ReadonlyArray<readonly [string, AttributionStringKey, number]>;
 
 /** The query parameters this product reads. Everything else is ignored. */

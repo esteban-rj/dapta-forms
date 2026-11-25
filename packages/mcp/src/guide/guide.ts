@@ -26,7 +26,8 @@ export const GUIDE_RULES: readonly string[] = [
   'The public_url a tool returns is the exact form link to give the user; form links are not built by hand. editor_url opens the form in the dForms editor.',
   'A VALIDATION_FAILED error lists every problem with its path inside the arguments (config.steps.2.question is the question of the third step), so one retry can fix them all.',
   "A STALE error means someone saved the form after it was read. The fix is to call get_form, apply the change again on what it returns and retry with its updated_at, which keeps the other person's changes.",
-  'Destinations are not part of the config: get_form leaves them out of `config` and update_form ignores them (with a warning). Webhooks and the HubSpot destination are set with set_destinations, which replaces the whole list; ping_webhook sends a test.',
+  'Destinations are not part of the config: get_form leaves them out of `config` and update_form ignores them (with a warning). Webhooks, the HubSpot destination, the Google Sheets destination, the Salesforce destination and the HighLevel destination are set with set_destinations, which replaces the whole list; ping_webhook sends a test. Google Sheets, Salesforce and HighLevel deliver through the connection of the workspace (list_integrations): a new or changed enabled entry for a provider that is not connected (in set_destinations, or in the config of create_form) is refused with INTEGRATION_NOT_CONNECTED and the integrations page, which the user opens in a browser to connect it (a provider the deployment cannot connect at all, listed in `unavailable`, gets no page: it stays out of the list or switched off until whoever runs the deployment sets it up), and an entry kept as stored while its provider is disconnected comes back in `warnings`. When the list holds a Google Sheets destination, set_destinations also reports `sheet_header_row`: whether row 1 of the spreadsheet was brought in line with the columns, or left untouched because it holds something dForms did not write (`foreign`), is out of date (`stale`) or Google could not be reached (`failed`). A row 1 left untouched is worth telling the user about, since responses then land under headings that may not match the columns.',
+  'A HighLevel destination (type gohighlevel) maps answers to contact fields listed by list_gohighlevel_fields: a standard field as { "kind": "standard", "field": key }, a custom field as { "kind": "custom", "id", "key", "dataType" } copied as listed. The score only goes to a NUMERICAL custom field, the submitted date to a DATE one and a UTM to a TEXT or LARGE_TEXT one; a fixed value (staticFields) never targets email or phone, because HighLevel finds contacts by them. tags are only ever added to the contact, source names where it came from (absent: "dForms: {form name}"), and events absent sends complete responses only (["partial", "complete"] also sends partial saves). HighLevel is connected only in the dashboard, by an owner or admin who pastes a Private Integration token; when list_integrations lists it in rejected, its token stopped working and the user reconnects it there.',
   'A new form gets `branding` even when none is sent: the workspace brand kit, or the dForms default look (create_form says so in its warnings). update_form expects `branding` back exactly as get_form returns it; an update_form that leaves it out is refused with BRANDING_MISSING, and `branding: null` removes it on purpose.',
   'Nothing sent is changed silently: a field outside config_schema, a repeated step key, option value or outcome id, a goto or a condition naming a step that does not exist, "@score" with op "in", or a min above its max is refused with VALIDATION_FAILED and its path. A problem that was already in the form as read is not refused but reported in warnings, for the user to know.',
   'When is_live is false (live_step_count 0) the form was never published with a step and its public_url opens an empty form. The link is ready to share once publish_form makes a draft live.',
@@ -77,7 +78,11 @@ export const GUIDE_STEP_TYPES: ReadonlyArray<{ type: string; use_for: string }> 
   { type: 'file', use_for: 'An upload. Only works when the deployment has file storage.' },
   { type: 'message', use_for: 'An info screen with no input. Its body text is `helper`.' },
   { type: 'reveal', use_for: 'A result screen that asks nothing.' },
-  { type: 'scheduler', use_for: 'An embedded booking page (`scheduler.provider` and `scheduler.url`).' },
+  {
+    type: 'scheduler',
+    use_for:
+      'An embedded booking page (`scheduler.provider` and `scheduler.url`). New scheduler steps default to provider dcal; absent means calendly. list_event_types with provider calendly lists Calendly event types (provider is required, with no default); a dCal event is picked in the form editor.',
+  },
 ];
 
 export const GUIDE_LOGIC: readonly string[] = [
@@ -87,6 +92,8 @@ export const GUIDE_LOGIC: readonly string[] = [
   '"@score" is the running score of the steps shown before this one, not counting the step itself. Only gt, lt, eq and between apply to it. Put a step gated by score after the last scored question.',
   'Scoring: each answer adds points and the total picks one of `outcomes` by minScore and maxScore (inclusive). Leave maxScore off the highest range so every score lands somewhere.',
   'Placeholders: [step_key] inserts an earlier answer into a question, helper, outcome label or message, ending texts, reveal texts and redirectUrl. A name step exposes [firstname], [lastname] and [name]. A placeholder with no answer disappears with the comma or space that joined it. A checkbox step does not take placeholders in its question.',
+  'An answer placed in redirectUrl (an email, say) ends up in the destination site\'s browser history and server logs, so prefer a non-identifying one. When the form runs embedded, redirectUrl never carries answers: every query parameter with a placeholder is dropped.',
+  'ending.forwardUtm true appends the visitor\'s utm_* parameters to every redirect (the ending one, an outcome\'s own redirectUrl and the one after a booking), embedded or not. It never overwrites a utm_* key already written in the URL. Absent or false forwards nothing.',
 ];
 
 export const GUIDE_EXAMPLES: ReadonlyArray<{ name: string; what: string; config: unknown }> = [
@@ -98,7 +105,7 @@ export const GUIDE_EXAMPLES: ReadonlyArray<{ name: string; what: string; config:
   },
   {
     name: 'booking_gated_by_score',
-    what: 'A booking page only for high scores: the scheduler step hides below 14 points.',
+    what: 'A booking page only for high scores: the scheduler step hides below 14 points. It uses a Calendly link from list_event_types; a dCal step is set up in the editor.',
     config: SCORE_GATE_CONFIG,
   },
 ];

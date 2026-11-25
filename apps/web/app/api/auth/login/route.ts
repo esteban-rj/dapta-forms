@@ -1,9 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import { cookies } from 'next/headers';
-import { NextResponse, type NextRequest } from 'next/server';
+import { after, NextResponse, type NextRequest } from 'next/server';
 import { parseAttribution } from '@quill/types';
 import { PH_ID_COOKIE, PH_ID_QUERY_KEY, sanitizeLandingDistinctId } from '@/lib/attribution';
 import { authProvider } from '@/lib/auth-session';
+import { ensureBrowserId } from '@/lib/browser-id';
+import { recordLoginStarted, type LoginStart } from '@/lib/login-started';
+import { resolveProductAnalytics } from '@/lib/product-analytics';
+import { SCREEN_PARAM, wantsSignUp } from '@/lib/login-screen';
 import { canonicalHop, requestOrigin } from '@/lib/request-origin';
 
 const OAUTH_STATE_COOKIE = 'quill_oauth_state';
@@ -16,6 +20,32 @@ const OAUTH_STATE_COOKIE = 'quill_oauth_state';
  * the login attempt — the callback is the only reader.
  */
 const ATTRIBUTION_COOKIE = 'quill_attribution';
+
+/** The campaign source of an already-parked attribution cookie, or null. */
+function parkedUtmSource(raw: string | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const parked = JSON.parse(raw) as { utmSource?: unknown } | null;
+    return typeof parked?.utmSource === 'string' ? parked.utmSource : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `forms_login_started` (lib/login-started.ts), sent after the redirect has gone
+ * out, never in front of it. Outside a request (a script, a spec) `after`
+ * throws, and there is then nothing to record.
+ */
+function scheduleLoginStarted(start: LoginStart): void {
+  try {
+    const analytics = resolveProductAnalytics();
+    if (!analytics.key) return;
+    after(() => recordLoginStarted(start, analytics));
+  } catch {
+    /* not in a request: nothing to record */
+  }
+}
 
 /**
  * WorkOS login hand-off (AUTH-WEB-CONTRACT §3.1). The web holds NO WorkOS secret;
@@ -38,7 +68,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   // as /login?error=state. Hop to the same path and query, as this route got
   // them, on the PUBLIC_APP_URL origin BEFORE any cookie is written: the tags,
   // `ph_id`, `next` and `prompt` are then parked on the host whose callback
-  // reads them. The target is the configured origin, never taken from a
+  // reads them, and `screen` reaches the request below unchanged. The target is the configured origin, never taken from a
   // header, so this is no open redirect (`canonicalHop` has the rest).
   const hop = canonicalHop(req);
   if (hop) return hop;
@@ -52,6 +82,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     secure: process.env.NODE_ENV === 'production',
     maxAge: 600, // 10 min — just long enough to finish the round-trip
   });
+  // This browser's first-party id (lib/browser-id.ts), minted if it has none,
+  // so the callback can hand it to the referral claim. Never cleared.
+  ensureBrowserId(jar);
 
   // Park the acquisition tags the root page forwarded. Same lifetime as the CSRF
   // state: they are only meaningful for THIS login attempt, and a stale cookie
@@ -63,6 +96,14 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   // — and this route is directly reachable, so it is the one surface that sees a
   // raw query string somebody else composed.
   const sp = new URL(req.url).searchParams;
+  // What this attempt is filed under for `forms_login_started`: what was parked
+  // already wins, the same first-attempt rule as the cookies below. Read before
+  // they are written.
+  // It is the cookie's PRESENCE that decides, not its source: a parked blob with
+  // a referrer and no `utmSource` is still the attribution the callback sends,
+  // so this attempt's tags must not stand in for the missing source.
+  const parkedLandingId = jar.get(PH_ID_COOKIE)?.value;
+  const parkedAttribution = jar.get(ATTRIBUTION_COOKIE)?.value;
   const attribution = parseAttribution(
     Object.fromEntries([...new Set(sp.keys())].map((k) => [k, sp.getAll(k)])),
   );
@@ -104,15 +145,40 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   // ends up on a WorkOS URL. The bare auto-redirect from /login sends no
   // prompt, keeping the arriving-from-Dapta silent SSO.
   const prompt = sp.get('prompt') === 'login' ? 'login' : null;
+  // `?screen=sign-up` (lib/login-screen.ts): a landing's "create an account"
+  // call to action, passed on by the root page beside the campaign tags.
+  // Allowlisted the same way, and what goes on the wire is a constant, never
+  // the value that arrived. The identity service already carries its sign-up
+  // hint onto the authorize URL, so unlike `prompt` there is nothing to patch
+  // on its answer. Every other arrival, the /login redirect of a signed-out
+  // dashboard visit included, sends nothing and opens on the sign-in screen as
+  // before. A repeated parameter is not a choice, as on the root page: it
+  // reads as none.
+  const screens = sp.getAll(SCREEN_PARAM);
+  const signUp = screens.length === 1 && wantsSignUp(screens[0]);
 
   const returnTo = `${origin}/api/auth/callback`;
   const res = await fetch(
     `${iam}/auth/login-url?returnTo=${encodeURIComponent(returnTo)}&state=${encodeURIComponent(state)}` +
-      (prompt ? `&prompt=${prompt}` : ''),
+      (prompt ? `&prompt=${prompt}` : '') +
+      (signUp ? '&screenHint=sign-up' : ''),
     { cache: 'no-store' },
   ).catch(() => null);
   const loginUrl = res && res.ok ? ((await res.json().catch(() => ({}))) as { loginUrl?: string }).loginUrl : undefined;
   if (!loginUrl) return NextResponse.redirect(new URL('/login?error=login', origin));
+  // The only record of someone who opens the hosted screen and leaves. Called
+  // right before each redirect there, never on the way to the error card; a
+  // no-op with analytics off.
+  const at = new Date();
+  const started = () =>
+    scheduleLoginStarted({
+      screen: signUp ? 'sign-up' : 'sign-in',
+      landingId: parkedLandingId ?? landingId,
+      utmSource: parkedAttribution ? parkedUtmSource(parkedAttribution) : attribution?.utmSource,
+      origin,
+      userAgent: req.headers.get('user-agent'),
+      at,
+    });
   // The IAM currently drops the prompt param instead of forwarding it to the
   // authorize URL, so patch it on ourselves, exactly like Orbit's
   // enforcePromptOnLoginUrl ("if IAM forgets to propagate prompt to WorkOS,
@@ -121,10 +187,14 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     try {
       const patched = new URL(loginUrl);
       patched.searchParams.set('prompt', prompt);
-      return NextResponse.redirect(patched.toString());
+      const redirect = NextResponse.redirect(patched.toString());
+      started();
+      return redirect;
     } catch {
       return NextResponse.redirect(new URL('/login?error=login', origin));
     }
   }
-  return NextResponse.redirect(loginUrl);
+  const redirect = NextResponse.redirect(loginUrl);
+  started();
+  return redirect;
 }

@@ -73,9 +73,8 @@ import {
   formInputSchema,
   publishFormInputSchema,
   formSlugInputSchema,
-  hasExtraHubspotDestination,
+  extraOnePerFormDestination,
   maskConfigSecrets,
-  ONE_HUBSPOT_DESTINATION_MESSAGE,
   memberInviteSchema,
   memberPatchSchema,
   notificationSettingPatchSchema,
@@ -95,6 +94,7 @@ import { AdminService } from './admin.service';
 import { SubmissionService } from './submission.service';
 import { AnalyticsService } from './analytics.service';
 import { AuthService, type ReqLike } from './auth.service';
+import { isAgentPrincipal } from './auth.provider';
 import { createdVia } from './api-keys';
 import { WorkspaceService } from './workspace.service';
 import { EmailEffects } from './email-effects';
@@ -103,12 +103,21 @@ import { UploadService } from './upload.service';
 import { unwrap } from './http';
 import { parse } from './validation';
 import { keyFormBodyIssues, keyNormalizedConfig } from './strict-config';
+import {
+  connectedDestinationProviders,
+  unavailableDestinationProviders,
+  connectionVerdict,
+  INTEGRATION_NOT_CONNECTED,
+  integrationsPageUrl,
+} from './destination-connections';
+import { goHighLevelMappingIssue } from './gohighlevel-mappings';
 import type { ServerEnv } from '@quill/config/env';
 import { assertAdmin, assertCanManageTarget, assertNotSelf, assertOwner } from './permissions';
 import { parseIntParam, parseKinds, parseOutboxStatuses } from './query-params';
 import { parseSort, parseSubmissionFilter, workspaceZone, type FilterQuery } from './submission-filter';
 import type { CaptchaVerifier } from './captcha';
 import { AttributionService } from './attribution.service';
+import { ReferralService } from './referral.service';
 import { CAPTCHA, DB, ENV } from './tokens';
 
 function unwrapCrud<T>(r: CrudResult<T>): T {
@@ -207,6 +216,9 @@ export class AdminCrudController {
     // surfaces carry the "Made with dForms" attribution. Last and optional for
     // the positional reason; absent reads as showing, as before the setting.
     @Optional() @Inject(AttributionService) private readonly attribution?: AttributionService,
+    // The person's referral link and progress (`me`). Last and optional for
+    // the positional reason; absent reads as the program switched off.
+    @Optional() @Inject(ReferralService) private readonly referrals?: ReferralService,
   ) {}
 
   /**
@@ -269,7 +281,19 @@ export class AdminCrudController {
     // `attributionBadge`, not `attribution`: that key is the signup's UTM
     // record, already on `view`.
     const attributionBadge = { showing: this.attribution ? await this.attribution.showFor(p.accountId) : true };
-    return { ...view, staff, uploads, captcha, attributionBadge };
+    // The referral program, for the left menu: the person's link and progress,
+    // keyed by the person rather than this workspace (ADR 0005). Switched off,
+    // `{ enabled: false }` and nothing is written. An agent (API key, MCP) is
+    // not a person sharing a link: it gets the program off and writes nothing.
+    const referral =
+      this.referrals && !isAgentPrincipal(p)
+        ? await this.referrals.forMember(p.accountId, p.memberId)
+        : { enabled: false };
+    // The browser this dashboard load came from is the person's from now on
+    // (0034): a referral signed up in it later is not credited to them.
+    // Best-effort, never fails the page; nothing for an agent.
+    if (this.referrals && !isAgentPrincipal(p)) await this.referrals.seenInBrowser(p);
+    return { ...view, staff, uploads, captcha, attributionBadge, referral };
   }
 
   /**
@@ -602,10 +626,42 @@ export class AdminCrudController {
     // exempt — see `hasExtraHubspotDestination`). Same one-HubSpot rule as
     // PUT /forms/:id/destinations — enforced here rather than in the schema so
     // stored configs that already carry two keep parsing.
-    if (hasExtraHubspotDestination((input.config as { destinations?: unknown } | undefined)?.destinations)) {
+    // The same rule covers Salesforce and HighLevel: two destinations draining
+    // in parallel would both look the respondent up, both find nothing, and
+    // both create a record.
+    const extra = extraOnePerFormDestination((input.config as { destinations?: unknown } | undefined)?.destinations);
+    if (extra) throw new BadRequestException({ error: 'BAD_REQUEST', message: extra.message });
+    // HighLevel custom-field types, as on PUT /forms/:id/destinations (nothing stored yet).
+    const ghlIssue = goHighLevelMappingIssue((input.config as { destinations?: unknown } | undefined)?.destinations);
+    if (ghlIssue) throw new BadRequestException({ error: 'BAD_REQUEST', message: ghlIssue.message, path: ghlIssue.path });
+    // A Sheets or Salesforce destination with no connection behind it would
+    // deliver into nothing, exactly as on PUT /forms/:id/destinations, so the
+    // same rule runs here with nothing stored to compare against: every
+    // enabled entry is new. An agent is refused, a session is warned.
+    // Duplicate is exempt on purpose: it copies a form of the SAME account,
+    // whose connections are the same ones, so the copy promises nothing the
+    // source does not, and the source's entries are stored state, which this
+    // rule never refuses.
+    const sentDestinations = (input.config as { destinations?: unknown } | undefined)?.destinations;
+    const verdict = Array.isArray(sentDestinations)
+      ? connectionVerdict({
+          incoming: sentDestinations,
+          stored: [],
+          connected: await connectedDestinationProviders(this.db, p.accountId, this.env),
+          unavailable: unavailableDestinationProviders(this.env),
+          agent: isAgentPrincipal(p),
+          integrationsUrl: integrationsPageUrl(this.env?.PUBLIC_APP_URL),
+          strip: (e) => e,
+        })
+      : { refusal: null, warnings: [] };
+    if (verdict.refusal) {
       throw new BadRequestException({
-        error: 'BAD_REQUEST',
-        message: ONE_HUBSPOT_DESTINATION_MESSAGE,
+        error: INTEGRATION_NOT_CONNECTED,
+        message: verdict.refusal.message,
+        provider: verdict.refusal.type,
+        index: verdict.refusal.index,
+        integrationsUrl: verdict.refusal.integrationsUrl,
+        unavailable: verdict.refusal.unavailable,
       });
     }
     // New forms are born on-brand: snapshot the workspace brand kit into the
@@ -638,7 +694,8 @@ export class AdminCrudController {
       await createForm(this.db, p.accountId, { ...input, config, createdVia: via }, p.memberId),
     );
     await this.productAnalytics?.captureForMember('form_created', p, { form_id: created.id, via });
-    return this.formView(p.accountId, created);
+    const view = await this.formView(p.accountId, created);
+    return verdict.warnings.length ? { ...view, warnings: verdict.warnings } : view;
   }
 
   /**
@@ -1006,11 +1063,19 @@ export class AdminCrudController {
   async inviteMember(@Req() req: ReqLike, @Body() body: unknown) {
     const input = parse(memberInviteSchema, body);
     if (this.workspacesSvc && (await this.workspacesSvc.hasUpstream(req))) {
-      return this.workspacesSvc.inviteUpstream(req, input);
+      const invited = await this.workspacesSvc.inviteUpstream(req, input);
+      // Who invited whom, for the referral program: the identity service's
+      // invitation has no inviter. After the invitation went out; never throws.
+      if (this.referrals?.enabled) {
+        const inviter = await this.auth.resolveHost(req).catch(() => null);
+        if (inviter) await this.referrals.recordInvite(inviter, invited.email ?? input.email);
+      }
+      return invited;
     }
     const p = await this.auth.resolveHost(req);
     assertAdmin(p);
     const member = unwrapCrud(await inviteMember(this.db, p.accountId, input));
+    await this.referrals?.recordInvite(p, member.email ?? input.email);
     // Tell them. Until now the row was created and nobody was ever notified.
     // Enqueued (never sent inline) and fire-and-forget: a mail provider being
     // down must not fail an invite that already succeeded.

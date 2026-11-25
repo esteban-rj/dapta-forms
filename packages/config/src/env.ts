@@ -118,6 +118,44 @@ export const serverEnvSchema = z.object({
   // from whatever the callback carried). Never sent to the browser.
   CALENDLY_API_TOKEN: z.string().optional(),
 
+  // Google Sheets destination (OAuth, per account). The OAuth CLIENT is the
+  // deployment's, not the end user's: every account that connects goes through
+  // this one client and stores only its own refresh token, so the client secret
+  // lives here and never in the database.
+  //
+  // The hosted deployment reuses the Dapta platform's existing Google client.
+  // The app asks it for `drive.file` only (the files dForms creates or is handed
+  // in the Picker), a scope Google classes as non-sensitive, so this feature
+  // needs no verification round. A fork points these at its own client.
+  //
+  // All three unset = the Google Sheets card stays off: `connect` reports the
+  // feature unavailable instead of starting a flow that could not finish.
+  // `GOOGLE_OAUTH_REDIRECT_URI` must match an authorized redirect URI on the
+  // client EXACTLY (Google compares the string, not the host), and must point at
+  // this API's own callback route, not at the web app. Server-only, all three.
+  GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_OAUTH_REDIRECT_URI: z
+    .string()
+    .refine((v) => v === '' || /^https?:\/\//.test(v), {
+      message: 'GOOGLE_OAUTH_REDIRECT_URI must be an http(s) URL.',
+    })
+    .optional(),
+  // Google Picker, how an EXISTING spreadsheet is chosen (the OAuth scope only
+  // reaches files the app created or the user picked). A browser API key from
+  // the same Cloud project as the OAuth client, restricted by HTTP referrer on
+  // Google's side: it is sent to the browser by design, so the restriction is
+  // what protects it, not secrecy. Unset = no Picker, and the spreadsheet card
+  // offers only "create a new spreadsheet". `GOOGLE_PICKER_APP_ID` is the Cloud
+  // project NUMBER; unset, it is read off the client id, which starts with it.
+  GOOGLE_PICKER_API_KEY: z.string().optional(),
+  GOOGLE_PICKER_APP_ID: z
+    .string()
+    .refine((v) => v === '' || /^\d+$/.test(v), {
+      message: 'GOOGLE_PICKER_APP_ID must be the numeric Cloud project number.',
+    })
+    .optional(),
+
   // Premium features. Forms is ALWAYS free: `locked` gates premium on the
   // customer's PAID Dapta AI subscription; `open` unlocks everything, so a bare
   // OSS fork gets every feature with no upstream wired. OPTIONAL, and what
@@ -162,6 +200,23 @@ export const serverEnvSchema = z.object({
   // someone who quits mid-wizard is left with zero forms, which is a fact the
   // funnel can see. With a demo seeded for everyone, that state is invisible.
   ONBOARDING_WIZARD: boolish.default('true'),
+
+  // The referral program ("invite 5, remove the badge for life"): every
+  // signed-in person gets a personal referral link in the left menu. Explicit
+  // wins; UNSET means on exactly where the identity service runs
+  // (`referralProgramEnabled`: Dapta's own deployments), and off everywhere
+  // else, so a fork or a local dev never shows a Dapta campaign. `false` is the
+  // one switch that stops the whole program at once. Resolved ONCE in the API
+  // (`referralOptions`) and read by the web app off `/v1/me.referral`, never
+  // from its own copy. The link points at NEXT_PUBLIC_LANDING_URL when set,
+  // else at PUBLIC_APP_URL; with neither, the program stays off.
+  REFERRAL_PROGRAM: blankAsUnset(boolish.optional()),
+  // When the referral CAMPAIGN ends, as an ISO 8601 date-time with a time
+  // zone (2026-12-31T23:59:59Z, or -05:00). Unset = no end. After it, only the
+  // campaign-scoped surfaces stop (the top banner, the nudge email); the link,
+  // the count, the menu entry and earned unlocks stay. Checked at boot
+  // (`referralCampaignEndsAt`) and exposed as `/v1/me.referral.campaignActive`.
+  REFERRAL_CAMPAIGN_ENDS_AT: blankAsUnset(z.string().optional()),
 
   // Auth — unset selects the local dev stub.
   AUTH_PROVIDER: z.enum(['local', 'workos']).default('local'),
@@ -345,6 +400,22 @@ export const serverEnvSchema = z.object({
   DAPTA_SYNC_FLOW_URL: z.string().url().optional(),
   DAPTA_SYNC_FLOW_KEY: z.string().optional(),
 
+  // dCal, the scheduler a `scheduler` step can embed instead of Calendly.
+  //
+  // There is deliberately NO token here, and that is the whole point of this
+  // integration: dCal projects the same identity service this app does, so the
+  // author's own session is the credential. The API forwards their bearer to
+  // dCal's host API to list the workspaces and event types they can already
+  // reach; nothing is stored, nothing is encrypted, and a member can never see
+  // another member's events because dCal scopes the answer to the token.
+  //
+  // Both are absent in a bare fork, which simply reports dCal unavailable and
+  // offers Calendly (same graceful degradation as every other integration).
+  // They are two hosts because dCal is two apps: `API` serves `/v1`, `APP` is
+  // where a booking page and the event-type editor live.
+  DCAL_API_BASE_URL: z.string().url().optional(),
+  DCAL_APP_URL: z.string().url().optional(),
+
   // Object storage for the `file` question type. Uploads NEVER pass through
   // this process: the browser PUTs straight to the bucket with a short-lived
   // presigned URL the API mints, and the API verifies the object on submit.
@@ -447,6 +518,19 @@ export function vanityPremiumMode(env: Pick<ServerEnv, 'PREMIUM_FEATURES'>): 'op
  * then, and the projection is what writes the Dapta AI paid verdict.
  */
 export function iamWorkspacesEnabled(env: Pick<ServerEnv, 'IAM_BASE_URL' | 'AUTH_PROVIDER'>): boolean {
+  return env.AUTH_PROVIDER === 'workos' && !!env.IAM_BASE_URL;
+}
+
+/**
+ * `REFERRAL_PROGRAM`: explicit wins; unset is on exactly when the identity
+ * service runs (`iamWorkspacesEnabled`), which is Dapta's own deployments, and
+ * off for a fork or a local dev. The same "unset follows the deployment"
+ * rule as `attributionPremiumMode`.
+ */
+export function referralProgramEnabled(
+  env: Partial<Pick<ServerEnv, 'REFERRAL_PROGRAM' | 'IAM_BASE_URL' | 'AUTH_PROVIDER'>>,
+): boolean {
+  if (typeof env.REFERRAL_PROGRAM === 'boolean') return env.REFERRAL_PROGRAM;
   return env.AUTH_PROVIDER === 'workos' && !!env.IAM_BASE_URL;
 }
 
@@ -633,7 +717,32 @@ export function loadServerEnv(source: NodeJS.ProcessEnv = process.env): ServerEn
   apiDeprecation(parsed.data);
   // The same for the MCP OAuth settings: a login that cannot work never boots.
   mcpOAuth(parsed.data);
+  // And for the referral campaign's end: a typo must not silently run forever.
+  referralCampaignEndsAt(parsed.data);
   return parsed.data;
+}
+
+/** An ISO 8601 date-time with an explicit time zone (`Z` or `+hh:mm`). */
+const ISO_DATE_TIME_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * `REFERRAL_CAMPAIGN_ENDS_AT` in epoch ms, or null when unset (no end). Throws
+ * on anything that is not an ISO date-time with a time zone: a date alone or a
+ * zone-less time would end the campaign at a different hour on each server.
+ */
+export function referralCampaignEndsAt(
+  env: Partial<Pick<ServerEnv, 'REFERRAL_CAMPAIGN_ENDS_AT'>>,
+): number | null {
+  const raw = env.REFERRAL_CAMPAIGN_ENDS_AT?.trim();
+  if (!raw) return null;
+  const ms = ISO_DATE_TIME_WITH_ZONE.test(raw) ? Date.parse(raw) : Number.NaN;
+  if (Number.isNaN(ms)) {
+    throw new Error(
+      `Refusing to boot: REFERRAL_CAMPAIGN_ENDS_AT (${JSON.stringify(raw)}) is not an ISO date-time with a ` +
+        'time zone. Use e.g. 2026-12-31T23:59:59Z or 2026-12-31T23:59:59-05:00, or leave it unset for no end.',
+    );
+  }
+  return ms;
 }
 
 /** True when DATABASE_URL points at Postgres (vs SQLite). Scheme is case-insensitive. */

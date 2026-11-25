@@ -21,6 +21,8 @@ import {
   MCP_OAUTH,
   NOTIFIER,
   ONBOARDING_ENABLED,
+  REFERRAL_OPTIONS,
+  REFERRAL_UNLOCKS,
   PREMIUM_MODE,
   ATTRIBUTION_MODE,
   RATE_LIMITER,
@@ -32,6 +34,10 @@ import { AdminService } from './admin.service';
 import { AuthService } from './auth.service';
 import { EmailEffects } from './email-effects';
 import { DestinationEffects } from './destination-effects';
+import { GoogleSheetsAccessTokens } from './google-sheets-token';
+import { SalesforceAccessTokens } from './salesforce-auth';
+import { SalesforceFieldsService } from './salesforce-fields';
+import { GoHighLevelFieldsService } from './gohighlevel-fields';
 import { BookingEffects } from './booking-effects';
 import { BookingSyncEffects } from './booking-sync';
 import { AnalyticsEffects } from './analytics-effects';
@@ -47,7 +53,7 @@ import { createObjectStorage } from './storage';
 import { createCaptchaVerifier } from './captcha';
 import { UploadService } from './upload.service';
 import { resolveEntitlementsProvider } from './entitlements.provider';
-import { createAuthProvider, type SignupObserver } from './auth.provider';
+import { createAuthProvider, type NewPersonObserver, type SignupObserver } from './auth.provider';
 import { WorkspaceProjection } from './workspace-projection';
 import { IamWorkspacesClient } from './iam-workspaces';
 import { WorkspaceService } from './workspace.service';
@@ -58,7 +64,12 @@ import { AdminCrudController } from './admin-crud.controller';
 import { FormAiController } from './form-ai.controller';
 import { BrandingController } from './branding.controller';
 import { AttributionController } from './attribution.controller';
+import { ANNOUNCEMENTS_OPTIONS, AnnouncementsController, isDaptaDeployment } from './announcements.controller';
 import { AttributionService } from './attribution.service';
+import { ReferralService, referralOptions } from './referral.service';
+import { PersonReferralUnlocks } from './referral-unlocks';
+import { ReferralController } from './referral.controller';
+import { ReferralBannerController } from './referral-banner.controller';
 import { LinkPageController } from './link-page.controller';
 import { LinkPageService } from './link-page.service';
 import { AnalyticsController } from './analytics.controller';
@@ -73,6 +84,7 @@ import {
   HubspotPropertiesService,
   IntegrationsController,
 } from './integrations.controller';
+import { DcalService } from './dcal.service';
 
 /** Product telemetry for "a person joined" — shared by the auth provider and the projection. */
 function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
@@ -91,6 +103,15 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
   };
 }
 
+/**
+ * A person's first sign-in, for the referral program: credit whoever invited
+ * their address as a teammate. Not wired with the program off, so a sign-in
+ * then costs exactly what it did before.
+ */
+function newPersonObserver(referrals: ReferralService): NewPersonObserver | undefined {
+  return referrals.enabled ? (person) => referrals.creditInvite(person) : undefined;
+}
+
 @Module({
   controllers: [
     HealthController,
@@ -105,6 +126,12 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
     AnalyticsController,
     IntegrationsController,
     FormDestinationsController,
+    // GET /v1/me/announcement + POST /v1/me/announcements/:id: in-app news,
+    // once per person. Session only (see the controller).
+    AnnouncementsController,
+    // POST /v1/me/referral/claim: the sign-in callback credits a new person
+    // to a referral link's owner. Per person, any role, session only.
+    ReferralController,
     // POST /mcp: the dForms MCP server (@quill/mcp). Runs each tool through the
     // form handlers above, so it resolves them from the module once it is built.
     McpController,
@@ -114,9 +141,17 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
     // GET /.well-known/openai-apps-challenge: OpenAI's domain-verification
     // token for the ChatGPT app. 404 unless OPENAI_APPS_CHALLENGE_TOKEN is set.
     OpenAiAppsChallengeController,
+    // POST /v1/me/referral/banner/dismiss: the referral banner's close, for
+    // 7 days, per person. Session only (see the controller).
+    ReferralBannerController,
   ],
   providers: [
     { provide: ENV, useFactory: () => loadServerEnv() },
+    {
+      provide: ANNOUNCEMENTS_OPTIONS,
+      useFactory: (env: ServerEnv) => ({ dapta: isDaptaDeployment(env) }),
+      inject: [ENV],
+    },
     { provide: DB, useFactory: () => createDb() },
     {
       provide: EMAIL,
@@ -161,6 +196,9 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
     // means locked whenever the identity service (the paid verdict's only
     // source) is configured. See `attributionPremiumMode`.
     { provide: ATTRIBUTION_MODE, useFactory: (env: ServerEnv) => attributionPremiumMode(env), inject: [ENV] },
+    // The rule's second unlock source: a workspace any of whose owners earned
+    // a referral unlock (5 referrals) may hide it, with no expiry.
+    { provide: REFERRAL_UNLOCKS, useClass: PersonReferralUnlocks },
     AttributionService,
     // The first-run wizard's switch, resolved ONCE and injected, so the API is
     // the single authority on whether onboarding is required. The web app reads
@@ -171,20 +209,26 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
       useFactory: (env: ServerEnv) => env.ONBOARDING_WIZARD,
       inject: [ENV],
     },
+    // The referral program's switch (REFERRAL_PROGRAM; unset = on with the IAM) and the
+    // base its links point at, resolved once like the wizard's. The web app
+    // reads it off `/v1/me.referral`.
+    { provide: REFERRAL_OPTIONS, useFactory: (env: ServerEnv) => referralOptions(env), inject: [ENV] },
+    ReferralService,
     // The identity service's workspaces ARE the workspaces (0015). Present only
     // when IAM_BASE_URL is configured AND the workos provider is selected; a
     // fork / plain local dev gets null and every workspace path stays local.
     {
       provide: WORKSPACE_PROJECTION,
-      useFactory: (env: ServerEnv, db: Db, productAnalytics: AnalyticsEffects) =>
+      useFactory: (env: ServerEnv, db: Db, productAnalytics: AnalyticsEffects, referrals: ReferralService) =>
         iamWorkspacesEnabled(env) && env.IAM_BASE_URL
           ? new WorkspaceProjection(db, new IamWorkspacesClient({ baseUrl: env.IAM_BASE_URL }), {
               seedEnv: env,
               onSignup: signupObserver(productAnalytics),
+              onNewPerson: newPersonObserver(referrals),
               staffDomains: env.IAM_STAFF_DOMAINS,
             })
           : null,
-      inject: [ENV, DB, AnalyticsEffects],
+      inject: [ENV, DB, AnalyticsEffects, ReferralService],
     },
     // Host auth backend selected by AUTH_PROVIDER (local stub / WorkOS overlay).
     {
@@ -198,8 +242,16 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
         db: Db,
         productAnalytics: AnalyticsEffects,
         projection: WorkspaceProjection | null,
-      ) => createAuthProvider(env, db, signupObserver(productAnalytics), projection ?? undefined),
-      inject: [ENV, DB, AnalyticsEffects, WORKSPACE_PROJECTION],
+        referrals: ReferralService,
+      ) =>
+        createAuthProvider(
+          env,
+          db,
+          signupObserver(productAnalytics),
+          projection ?? undefined,
+          newPersonObserver(referrals),
+        ),
+      inject: [ENV, DB, AnalyticsEffects, WORKSPACE_PROJECTION, ReferralService],
     },
     // Rate limiter for the public surface (P1-5): token bucket by default, noop
     // when RATE_LIMIT_ENABLED=false; swappable for a distributed limiter.
@@ -269,6 +321,27 @@ function signupObserver(productAnalytics: AnalyticsEffects): SignupObserver {
       useFactory: (env: ServerEnv, db: Db) => new CalendlyEventTypesService(env, db),
       inject: [ENV, DB],
     },
+    // dCal's event-type picker. No DB: this one holds no credential at all and
+    // forwards the author's own session (see DcalService). Factory for the same
+    // reason as its two siblings: `fetch` must not be DI-reflected.
+    {
+      provide: DcalService,
+      useFactory: (env: ServerEnv) => new DcalService(env),
+      inject: [ENV],
+    },
+    // The access token a Google Sheets delivery writes with, minted per account
+    // from its stored refresh token and cached. ONE instance for the whole app
+    // on purpose: the controller mints with it (to list a spreadsheet's tabs)
+    // and the delivery path mints with it, and a second cache would let a
+    // disconnect clear one of them while the other kept writing.
+    GoogleSheetsAccessTokens,
+    // One token cache and one field cache app-wide, shared by the controller
+    // and the delivery path so a disconnect clears what both of them read.
+    SalesforceAccessTokens,
+    SalesforceFieldsService,
+    // HighLevel's custom-field cache, for the same reason: one for the
+    // controller and the delivery path, so a disconnect clears both.
+    GoHighLevelFieldsService,
     // Drains the durable outbox (submission emails + destinations) with
     // retry+backoff — no silent loss on a provider outage (B1/B7/DM1).
     OutboxWorker,

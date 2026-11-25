@@ -14,15 +14,24 @@ import type {
   LinkPageFormRef,
   LinkPageSummary,
   FormDestination,
+  GoHighLevelFieldsResponse,
   MemberProfile,
   SubmissionFile,
   SubmissionsPage,
   SubmissionView,
 } from '@quill/types';
 import type { SubmissionFacets, SubmissionsSummary, SummaryAnswer } from '@quill/engine';
+import type {
+  AnnouncementBannerLogo,
+  AnnouncementCopyKey,
+  AnnouncementEvent,
+  AnnouncementRailItem,
+  AnnouncementVideo,
+} from '@quill/shared';
 import { serverApiUrl } from './api-url';
 import { getSession, clearSession, authProvider, getWorkspace } from './auth-session';
 import { analyticsSessionHeaders } from './analytics-session';
+import { browserIdHeaders } from './browser-id';
 import { resolveProductAnalytics } from './product-analytics';
 
 const API_URL = serverApiUrl;
@@ -63,7 +72,11 @@ async function req<T>(method: string, path: string, body?: unknown, opts: ReqOpt
   else if (session?.provider === 'local') headers['x-quill-email'] = session.email;
   if (workspace) headers['x-quill-workspace'] = workspace;
   // Lets the events this call emits link to the session recording it came from.
-  Object.assign(headers, analyticsSessionHeaders(await cookies(), resolveProductAnalytics()));
+  const jar = await cookies();
+  Object.assign(headers, analyticsSessionHeaders(jar, resolveProductAnalytics()));
+  // This browser's first-party id (lib/browser-id.ts): `/v1/me` records it for
+  // the referral program, and a first sign-in's invite credit checks it.
+  Object.assign(headers, browserIdHeaders(jar));
 
   const res = await fetch(`${API_URL}${path}`, {
     method,
@@ -187,6 +200,59 @@ export interface WebhookPingResult {
   message?: string;
 }
 
+/**
+ * The announcement the caller gets, as `GET /v1/me/announcement` answers it.
+ * `copy` is a key into `admin.announcements.items`: the language is the web
+ * app's to choose, like every other string.
+ */
+export interface AnnouncementView {
+  id: string;
+  copy: AnnouncementCopyKey;
+  cta: string;
+  visual: AnnouncementVideo;
+  railBadge: AnnouncementRailItem | null;
+  /** The Home banner's marks, or null when it has none. */
+  banner: { logos: readonly AnnouncementBannerLogo[] } | null;
+  /** Open the pop-up (the person has not closed or followed it). */
+  modal: boolean;
+  /** Show the rail badge (the person has not opened its page). */
+  badge: boolean;
+  /** Show the Home banner (for as long as the announcement runs). */
+  showBanner: boolean;
+  /** The person already reached the route: no visit left to report. */
+  followed: boolean;
+}
+
+/** `/v1/me.referral`. Later steps of the program add fields; unknown ones are ignored. */
+export type MeReferral =
+  | { enabled: false }
+  | {
+      enabled: true;
+      link: string;
+      count: number;
+      goal: number;
+      /**
+       * The campaign is running (no end set, or before `REFERRAL_CAMPAIGN_ENDS_AT`).
+       * Only the campaign-scoped surfaces key off it (the top banner); the link,
+       * the count and the menu entry stay after it ends. Optional so an older API
+       * that does not send it still parses.
+       */
+      campaignActive?: boolean;
+      /**
+       * Whether the top banner shows: the campaign runs, the person is below the
+       * goal and not unlocked, the workspace does not pay for Dapta AI, and the
+       * banner was not closed in the last 7 days. Optional for an older API,
+       * which then shows no banner (`referralBannerVisible`).
+       */
+      bannerVisible?: boolean;
+      /**
+       * The person reached the goal: the badge is gone from every workspace
+       * they own, for life; `true` hides the banner whatever `bannerVisible`
+       * says. Optional so an older API still parses.
+       */
+      unlocked?: boolean;
+    };
+
 export interface Me {
   accountId: string;
   /** The workspace's display name. */
@@ -235,6 +301,13 @@ export interface Me {
    * `attribution`, which is the signup's acquisition tags above.
    */
   attributionBadge?: { showing: boolean };
+  /**
+   * The referral program for this PERSON (the same in every workspace): their
+   * referral link and progress, or `{ enabled: false }` while the API has the
+   * program switched off. Optional so an older API reads as off. The web app
+   * never reads the switch itself.
+   */
+  referral?: MeReferral;
   /** `'staff'` when the caller is in this workspace by access grant, not by membership. */
   accessGrant: 'staff' | null;
   /** Staff of the deployment (by email domain, identity-backed only): may search and enter the whole estate. */
@@ -463,7 +536,16 @@ export interface HubSpotProperty {
 
 /** The property-picker response: disabled (no server token) or the property list. */
 /** What was being delivered. Mirrors `OutboxKind` in @quill/db. */
-export type DeliveryKind = 'webhook' | 'email' | 'hubspot' | 'booking_sync' | 'analytics' | 'dapta_sync';
+export type DeliveryKind =
+  | 'webhook'
+  | 'email'
+  | 'hubspot'
+  | 'google-sheets'
+  | 'salesforce'
+  | 'gohighlevel'
+  | 'booking_sync'
+  | 'analytics'
+  | 'dapta_sync';
 
 /**
  * How a delivery ended. `pending` covers both "not attempted yet" and "waiting
@@ -498,8 +580,45 @@ export type HubSpotPropertiesResponse =
   | { enabled: false; reason: string }
   | { enabled: true; cached: boolean; properties: HubSpotProperty[] };
 
-/** Account-level integration providers (paste-token connections). */
-export type IntegrationProvider = 'hubspot' | 'calendly';
+/**
+ * Account-level integration providers.
+ *
+ * Two of them are paste-token connections. `google-sheets` is not: it is
+ * connected by walking Google's consent screen, so the panel starts it through
+ * `authorizeGoogleSheets` and `connectIntegration` refuses it outright (the API
+ * answers 400 rather than storing a credential that would die within the hour).
+ */
+export type IntegrationProvider = 'hubspot' | 'calendly' | 'google-sheets' | 'salesforce' | 'gohighlevel';
+
+/** Why a HighLevel connection was refused, or what the browser decided (see `@quill/types`). */
+export type { GoHighLevelConnectError, GoHighLevelFieldsResponse } from '@quill/types';
+
+/**
+ * Why a Salesforce connection was refused (the API's `reason`), one per thing
+ * the admin has to go and fix. Never Salesforce's own error text.
+ */
+export type SalesforceConnectError =
+  | 'domain_invalid'
+  | 'invalid_client'
+  | 'no_run_as'
+  | 'rejected'
+  | 'unreachable';
+
+/** One writable Lead field of the connected org, for the mapping editor. */
+export interface SalesforceField {
+  /** API name, what a mapping stores. */
+  name: string;
+  label: string;
+  type: string;
+  /** Salesforce refuses a NEW Lead without it. */
+  required: boolean;
+  options?: { value: string; label: string }[];
+}
+
+/** GET /v1/integrations/salesforce/fields. */
+export type SalesforceFieldsResponse =
+  | { enabled: false; reason: 'not_connected' | 'rejected' | 'unavailable' }
+  | { enabled: true; cached: boolean; lead: SalesforceField[]; contact: string[] };
 
 /**
  * One account-level connection's token-free status (GET /v1/integrations). The
@@ -511,7 +630,67 @@ export interface IntegrationStatus {
   last4: string | null;
   label: string | null;
   connectedAt: number;
+  /** HighLevel only: the sub-account's Location ID. */
+  locationId?: string | null;
+  /**
+   * HighLevel only: when a delivery last got a 401 or 403 for this token
+   * (epoch ms). Null while it works; a successful connect clears it.
+   */
+  rejectedAt?: number | null;
 }
+
+/** One tab of a spreadsheet. `gid` is the `#gid=` in its URL. */
+export interface SheetTab {
+  title: string;
+  gid: number;
+}
+
+/**
+ * The tab picker's answer. `enabled: false` carries WHY, because the four
+ * reasons send an author to four different places: connect Google, check the
+ * link, ask whoever owns the spreadsheet for access, or try again.
+ */
+export type GoogleSheetsTabsResponse =
+  | { enabled: true; spreadsheetTitle: string; tabs: SheetTab[] }
+  | { enabled: false; reason: 'not_connected' | 'not_found' | 'forbidden' | 'unavailable' };
+
+/** A spreadsheet created for a form in the connected Google account. */
+export type GoogleSheetsCreateResponse =
+  | { ok: true; spreadsheetId: string; spreadsheetTitle: string; sheetTitle: string; gid: number }
+  | { ok: false; reason: 'not_connected' | 'forbidden' | 'unavailable' };
+
+/**
+ * What Google's Picker needs to open. The access token here is the one Google
+ * credential that reaches a browser, because the Picker cannot run without it;
+ * it reaches only the files this app created or was handed, and lasts an hour.
+ */
+export type GoogleSheetsPickerResponse =
+  | { enabled: true; accessToken: string; apiKey: string; appId: string }
+  | { enabled: false; reason: 'not_connected' | 'unavailable' };
+
+/** What writing the header row did. `written: false` means row 1 was in use. */
+export type GoogleSheetsHeaderRowResponse =
+  | { ok: true; written: true }
+  | { ok: true; written: false; reason: 'not_empty' }
+  | { ok: false; reason: 'not_connected' | 'not_found' | 'forbidden' | 'unavailable' };
+
+/**
+ * What keeping a form's header row in line with its columns did (the API's
+ * `SheetHeaderSync`). `foreign`: row 1 holds something dForms did not write,
+ * and it was left exactly as it was.
+ */
+export type SheetHeaderSync =
+  | { outcome: 'written' | 'unchanged' }
+  /** A `check` found row 1 is dForms' own but out of date (nothing written). */
+  | { outcome: 'stale' }
+  /** Row 1 does not match: what it holds, and what would be written instead. */
+  | { outcome: 'foreign'; current: string[]; headers: string[] }
+  | { outcome: 'failed'; reason: 'not_connected' | 'not_found' | 'forbidden' | 'unavailable' };
+
+/** POST /v1/forms/:id/destinations/google-sheets/header-row. */
+export type FormSheetHeaderRowResponse =
+  | ({ ok: true } & SheetHeaderSync)
+  | { ok: false; reason: 'not_configured' };
 
 /** GET /v1/integrations — this account's connections + server encryption availability. */
 export interface IntegrationsResponse {
@@ -524,6 +703,25 @@ export interface IntegrationsResponse {
    * integration that is actively syncing.
    */
   serverProvided?: IntegrationProvider[];
+  /**
+   * Providers this DEPLOYMENT cannot connect at all, because configuration only
+   * its operator can supply is absent (Google Sheets needs an OAuth client
+   * registered with Google). The pages leave their cards out: a card whose
+   * button can only fail is worse than no card.
+   */
+  unavailable?: IntegrationProvider[];
+  /**
+   * Whether an EXISTING spreadsheet can be chosen (Google's Picker needs a
+   * browser key the operator supplies). False or absent, the spreadsheet card
+   * offers only "create a new spreadsheet".
+   */
+  googlePicker?: boolean;
+  /**
+   * dCal on this deployment: where event types are created. Absent or null
+   * when the deployment has no dCal, and then the Connections page leaves its
+   * card out. Not a connection: dCal uses the author's own Dapta sign-in.
+   */
+  dcal?: { createEventUrl: string } | null;
 }
 
 /**
@@ -597,6 +795,69 @@ export interface CalendlyEventType {
 export type CalendlyEventTypesResponse =
   | { enabled: false; reason: string }
   | { enabled: true; cached: boolean; connectedAs: string | null; eventTypes: CalendlyEventType[] };
+
+/**
+ * One question a dCal event type's booking form asks, beyond the name, email
+ * and notes its form always asks. `name` is the field's own name, which is
+ * also its prefill parameter (`answer_<name>`): a NAME, where Calendly's ids
+ * are positional.
+ */
+export interface DcalBookingField {
+  name: string;
+  label: string;
+  type: string;
+  required: boolean;
+}
+
+/** A dCal event type the scheduler step can embed. */
+export interface DcalEventType {
+  /** dCal's own event-type id (what the step stores as `eventTypeUri`). */
+  id: string;
+  name: string;
+  /** The public booking page, already assembled by the API. */
+  schedulingUrl: string;
+  active: boolean;
+  durationMinutes: number;
+  /** Null for the author's own events; the team's name for a team event. */
+  teamName: string | null;
+  bookingFields: DcalBookingField[];
+}
+
+/** A workspace the author can act in, for the picker's switcher. */
+export interface DcalWorkspace {
+  id: string;
+  name: string;
+  current: boolean;
+}
+
+/**
+ * Why the dCal picker has no list (mirrors `DcalUnavailableCode` in the API).
+ * Absent on an answer from an API older than the code: read as `not_configured`,
+ * which is what that API meant by every refusal.
+ */
+export type DcalUnavailableCode =
+  | 'not_configured'
+  | 'no_session'
+  | 'session_rejected'
+  | 'no_booking_page'
+  | 'dcal_error';
+
+/**
+ * The dCal picker's response. Unlike the other two, "unavailable" here never
+ * means "connect something": there is no credential to connect. `code` says
+ * which of the reasons it is, so each gets its own sentence.
+ */
+export type DcalEventTypesResponse =
+  | { enabled: false; reason: string; code?: DcalUnavailableCode; setupUrl?: string | null }
+  | {
+      enabled: true;
+      cached: boolean;
+      connectedAs: string | null;
+      workspaces: DcalWorkspace[];
+      eventTypes: DcalEventType[];
+      /** dCal's event-type editor, for an author who has none yet. */
+      createEventUrl: string | null;
+    };
 
 export type { FormDestination };
 
@@ -686,6 +947,11 @@ export interface AttributionStatus {
    * API older than the field reads as seen (the old wording).
    */
   verdictSeen?: boolean;
+  /**
+   * The workspace holds a referral unlock (an owner of it reached the goal):
+   * the switch works, with no expiry. Optional: an older API reads as false.
+   */
+  referralUnlocked?: boolean;
 }
 
 export const adminApi = {
@@ -817,7 +1083,21 @@ export const adminApi = {
     req<CalendlyEventTypesResponse>('GET', '/v1/integrations/calendly/event-types'),
   /** Partial write: replaces ONLY the config's `destinations` key server-side. */
   updateFormDestinations: (id: string, destinations: FormDestination[]) =>
-    req<FormDetail>('PUT', `/v1/forms/${id}/destinations`, { destinations }),
+    req<FormDetail & { formActivityError?: string; sheetHeaders?: SheetHeaderSync }>(
+      'PUT',
+      `/v1/forms/${id}/destinations`,
+      { destinations },
+    ),
+  /**
+   * Bring the form's spreadsheet header row in line with its STORED columns.
+   * The API reads everything it needs from the form, so this sends no body.
+   */
+  syncFormSheetHeaders: (id: string, opts?: { replace?: boolean; check?: boolean }) =>
+    req<FormSheetHeaderRowResponse>(
+      'POST',
+      `/v1/forms/${id}/destinations/google-sheets/header-row`,
+      opts?.replace ? { replace: true } : opts?.check ? { check: true } : undefined,
+    ),
 
   // Account-level integration connections (paste-token model; admin/owner writes)
   /** This account's connections (token-free) + whether server encryption is available. */
@@ -854,6 +1134,15 @@ export const adminApi = {
    *  server action: this is the durable copy, and the one the notification
    *  emails are rendered from. */
   setMyLocale: (locale: 'en' | 'es') => req<{ ok: boolean; locale: 'en' | 'es' }>('PUT', '/v1/me/locale', { locale }),
+  /** Close the referral banner for the caller, in every workspace, for 7 days. */
+  dismissReferralBanner: () =>
+    req<{ dismissedUntil: number | null }>('POST', '/v1/me/referral/banner/dismiss', {}),
+  /** The one in-app announcement the caller gets now, or null (see `announcements.ts` in @quill/shared). */
+  announcement: () =>
+    req<{ announcement: AnnouncementView | null }>('GET', '/v1/me/announcement').then((r) => r.announcement ?? null),
+  /** Report what the caller did with an announcement: on screen, card closed, or route reached. */
+  recordAnnouncement: (id: string, event: AnnouncementEvent) =>
+    req<{ ok: boolean }>('POST', `/v1/me/announcements/${encodeURIComponent(id)}`, { event }),
   /** Every workspace the caller can enter, for the switcher. */
   listWorkspaces: () => req<Workspace[]>('GET', '/v1/workspaces'),
   /** Same list after forcing a re-read from the identity service (when there is one). */
@@ -885,6 +1174,52 @@ export const adminApi = {
   /** Validate + encrypt-store a pasted provider token; returns the token-free status. */
   connectIntegration: (provider: IntegrationProvider, token: string) =>
     req<IntegrationStatus>('POST', `/v1/integrations/${provider}/connect`, { token }),
+  /**
+   * Start the Google Sheets consent flow: returns the Google URL to send the
+   * browser to. The account this flow will connect is carried in a signed state
+   * minted by this authenticated call, so the URL must be followed as-is and
+   * never rebuilt by the caller.
+   */
+  authorizeGoogleSheets: (returnTo?: string) =>
+    req<{ authUrl: string }>(
+      'POST',
+      '/v1/integrations/google-sheets/authorize',
+      returnTo ? { returnTo } : undefined,
+    ),
+  /** The tabs of one spreadsheet, for the mapping editor's picker. */
+  googleSheetsTabs: (spreadsheetId: string) =>
+    req<GoogleSheetsTabsResponse>(
+      'GET',
+      `/v1/integrations/google-sheets/tabs?spreadsheetId=${encodeURIComponent(spreadsheetId)}`,
+    ),
+  /** Create a spreadsheet for a form, header row included, in one call. */
+  googleSheetsCreate: (body: { title: string; sheetTitle: string; headers: string[] }) =>
+    req<GoogleSheetsCreateResponse>('POST', '/v1/integrations/google-sheets/spreadsheets', body),
+  /** What the browser needs to open Google's Picker (carries an access token). */
+  googleSheetsPicker: () =>
+    req<GoogleSheetsPickerResponse>('GET', '/v1/integrations/google-sheets/picker'),
+  /** Write the header row of the chosen tab, once. Never overwrites a used row 1. */
+  googleSheetsHeaderRow: (body: { spreadsheetId: string; sheetTitle?: string; headers: string[] }) =>
+    req<GoogleSheetsHeaderRowResponse>('POST', '/v1/integrations/google-sheets/header-row', body),
+  /**
+   * Connect a Salesforce org with Client Credentials. The API proves the three
+   * values before storing them and answers the token-free status.
+   */
+  connectSalesforce: (body: { domain: string; consumerKey: string; consumerSecret: string }) =>
+    req<IntegrationStatus>('POST', '/v1/integrations/salesforce/connect', body),
+  /** The connected org's writable Lead fields; `refresh` re-reads the org. */
+  salesforceFields: (refresh = false) =>
+    req<SalesforceFieldsResponse>('GET', `/v1/integrations/salesforce/fields${refresh ? '?refresh=1' : ''}`),
+  /**
+   * Connect (or replace the token of) a HighLevel sub-account: a Private
+   * Integration token and the Location ID, or the sub-account's URL. The API
+   * proves both against HighLevel before storing them.
+   */
+  connectGoHighLevel: (body: { token: string; locationId: string }) =>
+    req<IntegrationStatus>('POST', '/v1/integrations/gohighlevel/connect', body),
+  /** The standard fields and the location's mappable custom fields; `refresh` re-reads the location. */
+  goHighLevelFields: (refresh = false) =>
+    req<GoHighLevelFieldsResponse>('GET', `/v1/integrations/gohighlevel/fields${refresh ? '?refresh=1' : ''}`),
   /** Disconnect a provider for this account (idempotent → 204). */
   disconnectIntegration: (provider: IntegrationProvider) =>
     req<void>('DELETE', `/v1/integrations/${provider}`),

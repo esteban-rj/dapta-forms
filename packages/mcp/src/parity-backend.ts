@@ -13,7 +13,7 @@
  * issues for a body the route refuses).
  */
 import type { SubmissionFacets, SubmissionsSummary, SummaryAnswer } from '@quill/engine';
-import type { FormDetail, McpCaller, ResponseItem, ResponseStatus } from './backend';
+import type { DestinationWarning, FormDetail, McpCaller, ResponseItem, ResponseStatus } from './backend';
 
 /** One folder of the workspace. */
 export interface FolderItem {
@@ -121,7 +121,27 @@ export interface DestinationsResult {
   destinations: unknown[];
   /** Why the HubSpot form activity could not be synced; the save itself went through. */
   formActivityError: string | null;
+  /**
+   * What the save did to row 1 of the Google Sheets destination's spreadsheet,
+   * exactly as the REST route reports it (`sheetHeaders`), or null when the
+   * save had no reason to look at row 1. The save itself went through either way.
+   */
+  sheetHeaders: SheetHeaderRowResult | null;
+  /**
+   * What the save went through with but delivers nothing yet, as the REST
+   * route reports it (`warnings`): an entry whose provider is not connected
+   * (stored as it already was), or a spreadsheet with no sheet or no headed
+   * column. Absent or empty when there is nothing to say.
+   */
+  warnings?: DestinationWarning[];
 }
+
+/** The header-row outcome of a destinations save. See the REST route's `sheetHeaders`. */
+export type SheetHeaderRowResult =
+  | { outcome: 'written' | 'unchanged' | 'stale' }
+  /** Row 1 holds something else and was left alone: what it holds, and what the columns would write. */
+  | { outcome: 'foreign'; current: string[]; headers: string[] }
+  | { outcome: 'failed'; reason: string };
 
 /** The answer of a test delivery to the form's webhook. */
 export interface WebhookPing {
@@ -287,6 +307,8 @@ export interface ApiParityBackend {
   listIntegrations(caller: McpCaller): Promise<Record<string, unknown>>;
   listWebhooks(caller: McpCaller): Promise<Array<Record<string, unknown>>>;
   hubspotProperties(caller: McpCaller): Promise<Record<string, unknown>>;
+  /** `GET /v1/integrations/gohighlevel/fields` (`refresh` skips the 5-minute copy). */
+  goHighLevelFields(caller: McpCaller, opts: { refresh: boolean }): Promise<Record<string, unknown>>;
   calendlyEventTypes(caller: McpCaller): Promise<Record<string, unknown>>;
 
   // Identity

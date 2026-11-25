@@ -21,6 +21,8 @@ export interface BuilderMessages {
     saving: string;
     draft: string;
     saveError: string;
+    /** Saved, except one integration that was left out (it is NOT saved). */
+    savedPartial: string;
     /** A save that could not reach the server is being retried automatically. */
     retrying: string;
     /** Banner offering to restore work recovered from the local crash backup. */
@@ -268,6 +270,18 @@ export interface BuilderMessages {
     revealPlays: string;
     /** Vertical layout: where the reveal actually plays (page-canvas block). */
     revealVerticalNote: string;
+    /**
+     * The canvas card a dCal scheduler shows before an event type is picked.
+     * It stands where `schedulerUnset` does for Calendly, and says what dCal
+     * is rather than only that nothing is configured: this is the first place
+     * most authors will meet it.
+     */
+    schedulerDcalSetupTitle: string;
+    schedulerDcalSetupBody: string;
+    schedulerDcalSetupPointOne: string;
+    schedulerDcalSetupPointTwo: string;
+    schedulerDcalSetupPick: string;
+    schedulerDcalSetupCreate: string;
     /** V6 — the scheduler's live Calendly embed on the canvas. */
     schedulerUnset: string;
     schedulerNote: string;
@@ -347,7 +361,54 @@ export interface BuilderMessages {
     schedulerMapPickFirst: string;
     schedulerMapName: string;
     schedulerMapEmail: string;
+    /** dCal's booking form asks for notes by itself, where Calendly's does not. */
+    schedulerMapNotes: string;
+    /**
+     * Beside the Notes row while it is on Automatic: Automatic fills it only
+     * from an answer keyed `notes`, which nothing else on screen says.
+     */
+    schedulerMapNotesAuto: string;
     schedulerMapAuto: string;
+    /**
+     * dCal, the third provider. It needs no connected credential: the author's
+     * own session lists their event types, so there is no "connect" state
+     * here, only "you have none yet".
+     */
+    /**
+     * The section hint under dCal. `schedulerHint` names Calendly, so reusing
+     * it here told an author picking dCal to pick a Calendly event.
+     */
+    schedulerDcalHint: string;
+    /**
+     * Whose list it is, dCal's rule. `schedulerScopedTo` states Calendly's
+     * ("owns or hosts", and team events only when that user is a host), which
+     * is not how dCal scopes it: the author's own events, plus their teams'.
+     */
+    schedulerDcalScopedTo: string;
+    schedulerProvider: string;
+    schedulerProviderCalendly: string;
+    schedulerProviderDcal: string;
+    schedulerDcalWorkspace: string;
+    /** No event type in THIS workspace. The two ways out follow. */
+    schedulerDcalEmpty: string;
+    /** Only shown when the author actually has another workspace to switch to. */
+    schedulerDcalEmptySwitch: string;
+    /** Opens dCal's event-type editor in a new tab. */
+    schedulerDcalCreate: string;
+    /** Re-reads the list, for when they come back from creating one. */
+    schedulerDcalRefresh: string;
+    schedulerDcalRefreshing: string;
+    /** dCal is not configured for this deployment, or it forwards no session to dCal. */
+    schedulerDcalUnavailable: string;
+    /** dCal refused the author's session (401/403): signing in again is the fix. */
+    schedulerDcalSignIn: string;
+    /** The author has no dCal booking page yet; the link below sets one up. */
+    schedulerDcalNoPage: string;
+    schedulerDcalNoPageLink: string;
+    /** dCal did not answer, or answered with an error. A retry follows. */
+    schedulerDcalError: string;
+    /** A team event, so the author can tell it from their own: `{team}` is its name. */
+    schedulerDcalTeam: string;
     /** V6 — where the form goes once the respondent books. */
     schedulerAfter: string;
     schedulerAfterHint: string;
@@ -440,7 +501,9 @@ export interface BuilderMessages {
     configureInConnect: string;
     /** No account-level HubSpot connection at all. */
     notConnected: string;
-    goToConnections: string;
+    goToIntegrations: string;
+    /** No HubSpot connection: it is connected on this form's Connect tab. */
+    connectInConnect: string;
     /** The form has nothing that can identify a contact. */
     needsEmail: string;
     /** A booking would supply the address, but its provider is not connected. */
@@ -630,6 +693,7 @@ const en: BuilderMessages = {
     saving: 'Saving…',
     draft: 'Draft',
     saveError: 'Not saved',
+    savedPartial: 'Partly saved',
     retrying: 'Retrying…',
     recoveryTitle: 'Unsaved changes recovered',
     recoveryBody:
@@ -795,6 +859,13 @@ const en: BuilderMessages = {
     revealSubtitlePlaceholder: 'Add a line of reassurance (optional)',
     revealPlays: 'Plays for {ms} ms, then the form continues on its own.',
     revealVerticalNote: 'Plays once, after Submit, before the result.',
+    schedulerDcalSetupTitle: 'Book the meeting without leaving the form',
+    schedulerDcalSetupBody:
+      'dCal is Dapta\u2019s own scheduler. Pick one of your event types and its booking page runs right here, inside this question.',
+    schedulerDcalSetupPointOne: 'Nothing to connect: your own account already lists your event types.',
+    schedulerDcalSetupPointTwo: 'Their name and email carry over, so nobody types them twice.',
+    schedulerDcalSetupPick: 'Pick an event type',
+    schedulerDcalSetupCreate: 'Create one in dCal',
     schedulerUnset: 'No event type picked yet',
     schedulerNote: 'Respondents pick a time here. Booking answers this question and moves the form on.',
     schedulerLoading: 'Loading the calendar…',
@@ -880,10 +951,29 @@ const en: BuilderMessages = {
     schedulerMapPickFirst: 'Pick an event type to see the fields its booking form asks for.',
     schedulerMapName: 'Name',
     schedulerMapEmail: 'Email',
+    schedulerMapNotes: 'Notes',
+    schedulerMapNotesAuto: 'Automatic fills this only when one of your questions has the key notes.',
     schedulerMapAuto: 'Automatic',
     schedulerAfter: 'After booking',
     schedulerAfterHint: 'What happens once the respondent picks a time.',
     schedulerAfterContinue: 'Continue to the next question',
+    schedulerDcalHint: 'Pick a dCal event type. When someone books, it counts as their answer.',
+    schedulerDcalScopedTo: 'Showing {email}\u2019s own event types, and their teams\u2019.',
+    schedulerProvider: 'Scheduler',
+    schedulerProviderCalendly: 'Calendly',
+    schedulerProviderDcal: 'dCal',
+    schedulerDcalWorkspace: 'Workspace',
+    schedulerDcalEmpty: 'This workspace has no event type yet.',
+    schedulerDcalEmptySwitch: 'Pick another workspace above, or:',
+    schedulerDcalCreate: 'Create one in dCal',
+    schedulerDcalRefresh: 'I created it, load the list',
+    schedulerDcalRefreshing: 'Loading the list again…',
+    schedulerDcalUnavailable: 'dCal is not available on this deployment.',
+    schedulerDcalSignIn: 'dCal needs your Dapta sign-in. Sign in again, then come back to this question.',
+    schedulerDcalNoPage: 'You do not have a dCal booking page yet. Set it up in dCal, then refresh this list.',
+    schedulerDcalNoPageLink: 'Set up your booking page',
+    schedulerDcalError: 'dCal could not answer right now. Try again in a moment.',
+    schedulerDcalTeam: 'Team: {team}',
     schedulerAfterSubmit: 'Submit the form and show the ending',
     scoring: 'Scoring',
     scoringHint:
@@ -941,7 +1031,8 @@ const en: BuilderMessages = {
     notEnabled: 'HubSpot isn’t enabled on this form.',
     configureInConnect: 'Set up in Connect',
     notConnected: 'Connect HubSpot to map answers to contact properties.',
-    goToConnections: 'Go to Connections',
+    goToIntegrations: 'Go to Integrations',
+    connectInConnect: 'Connect it in the Connect tab',
     needsEmail:
       'This form asks for no email and books nothing, so HubSpot has no way to identify the contact. Nothing mapped here would sync. Add an email question, or a booking step.',
     schedulerDisconnected:
@@ -1117,6 +1208,7 @@ const es: BuilderMessages = {
     saving: 'Guardando…',
     draft: 'Borrador',
     saveError: 'Sin guardar',
+    savedPartial: 'Guardado en parte',
     retrying: 'Reintentando…',
     recoveryTitle: 'Cambios sin guardar recuperados',
     recoveryBody:
@@ -1126,7 +1218,7 @@ const es: BuilderMessages = {
     conflict: 'Guardado en otro lado',
     conflictTitle: 'Este formulario se guardó desde otro lugar',
     conflictBody:
-      'Otra persona, u otra pestaña, guardó este formulario mientras lo editabas. Tus cambios de acá todavía no están guardados.',
+      'Otra persona, u otra pestaña, guardó este formulario mientras lo editabas. Tus cambios de aquí todavía no están guardados.',
     conflictReload: 'Ver la versión guardada',
     conflictOverwrite: 'Quedarme con lo mío',
     preview: 'Vista previa',
@@ -1285,6 +1377,13 @@ const es: BuilderMessages = {
     revealSubtitlePlaceholder: 'Añade una línea que tranquilice (opcional)',
     revealPlays: 'Se muestra {ms} ms y luego el formulario continúa solo.',
     revealVerticalNote: 'Se muestra una vez, después de Enviar y antes del resultado.',
+    schedulerDcalSetupTitle: 'Agenda la reunión sin salir del formulario',
+    schedulerDcalSetupBody:
+      'dCal es el agendador de Dapta. Elige uno de tus tipos de evento y su página de agendamiento corre aquí mismo, dentro de esta pregunta.',
+    schedulerDcalSetupPointOne: 'No hay nada que conectar: tu propia cuenta ya lista tus tipos de evento.',
+    schedulerDcalSetupPointTwo: 'El nombre y el correo viajan solos, así nadie los escribe dos veces.',
+    schedulerDcalSetupPick: 'Elegir un tipo de evento',
+    schedulerDcalSetupCreate: 'Crear uno en dCal',
     schedulerUnset: 'Aún no eliges un tipo de evento',
     schedulerNote: 'Aquí eligen un horario. Agendar responde esta pregunta y avanza el formulario.',
     schedulerLoading: 'Cargando el calendario…',
@@ -1371,10 +1470,29 @@ const es: BuilderMessages = {
       'Elige un tipo de evento para ver los campos que pide su formulario de agendamiento.',
     schedulerMapName: 'Nombre',
     schedulerMapEmail: 'Correo electrónico',
+    schedulerMapNotes: 'Notas',
+    schedulerMapNotesAuto: 'Automático lo llena solo cuando una de tus preguntas tiene la clave notes.',
     schedulerMapAuto: 'Automático',
     schedulerAfter: 'Al agendar',
     schedulerAfterHint: 'Qué pasa cuando la persona elige un horario.',
     schedulerAfterContinue: 'Continuar a la siguiente pregunta',
+    schedulerDcalHint: 'Elige un tipo de evento de dCal. Cuando alguien agenda, cuenta como su respuesta.',
+    schedulerDcalScopedTo: 'Mostrando los eventos de {email} y los de sus equipos.',
+    schedulerProvider: 'Agendador',
+    schedulerProviderCalendly: 'Calendly',
+    schedulerProviderDcal: 'dCal',
+    schedulerDcalWorkspace: 'Espacio de trabajo',
+    schedulerDcalEmpty: 'Este espacio de trabajo todavía no tiene ningún evento.',
+    schedulerDcalEmptySwitch: 'Elige otro espacio de trabajo arriba, o bien:',
+    schedulerDcalCreate: 'Crear uno en dCal',
+    schedulerDcalRefresh: 'Ya lo creé, cargar la lista',
+    schedulerDcalRefreshing: 'Cargando la lista de nuevo…',
+    schedulerDcalUnavailable: 'dCal no está disponible en esta instalación.',
+    schedulerDcalSignIn: 'dCal necesita tu sesión de Dapta. Inicia sesión de nuevo y vuelve a esta pregunta.',
+    schedulerDcalNoPage: 'Todavía no tienes una página de agendamiento en dCal. Configúrala en dCal y luego actualiza esta lista.',
+    schedulerDcalNoPageLink: 'Configurar tu página de agendamiento',
+    schedulerDcalError: 'dCal no pudo responder ahora. Inténtalo de nuevo en un momento.',
+    schedulerDcalTeam: 'Equipo: {team}',
     schedulerAfterSubmit: 'Enviar el formulario y mostrar el final',
     scoring: 'Puntaje',
     scoringHint:
@@ -1432,14 +1550,15 @@ const es: BuilderMessages = {
     notEnabled: 'HubSpot no está habilitado en este formulario.',
     configureInConnect: 'Configurar en Conectar',
     notConnected: 'Conecta HubSpot para asignar respuestas a propiedades del contacto.',
-    goToConnections: 'Ir a Conexiones',
+    goToIntegrations: 'Ir a Integraciones',
+    connectInConnect: 'Conéctalo en la pestaña Conectar',
     needsEmail:
-      'Este formulario no pide correo ni agenda nada, así que HubSpot no tiene cómo identificar al contacto. Nada de lo que mapees acá se va a sincronizar. Agregá una pregunta de correo, o un paso de agenda.',
+      'Este formulario no pide correo ni agenda nada, así que HubSpot no tiene cómo identificar al contacto. Nada de lo que mapees acá se va a sincronizar. Agrega una pregunta de correo, o un paso de agenda.',
     schedulerDisconnected:
       'El paso de agenda aportaría el correo, pero Calendly no está conectado en esta cuenta: así que no se puede leer al invitado y nada de lo mapeado acá va a llegar a HubSpot.',
-    bookingIntro: 'Una reserva produce estos datos. Mandá cada uno a una propiedad del contacto.',
+    bookingIntro: 'Una reserva produce estos datos. Manda cada uno a una propiedad del contacto.',
     bookingStartHint:
-      'Se envía como texto, tal cual lo reportó la reserva. Para una propiedad de fecha real de HubSpot, usá la sincronización de reservas en Conectar.',
+      'Se envía como texto, tal cual lo reportó la reserva. Para una propiedad de fecha real de HubSpot, usa la sincronización de reservas en Conectar.',
     bookingEmailNote:
       'El correo del invitado es la llave del contacto: lo aporta la reserva, por eso no se mapea acá.',
   },
